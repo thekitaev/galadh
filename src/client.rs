@@ -55,8 +55,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match resp {
                 Ok(res) => {
                     for kv in res.into_inner().kvs.into_iter() {
-                        log::info!(
-                            "{} - {}",
+                        println!(
+                            "{}\n{}",
                             String::from_utf8(kv.key)?,
                             String::from_utf8(kv.value)?
                         );
@@ -64,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(err) => {
                     log::error!("Err getting key {}: {}", &key, err)
-                },
+                }
             }
         }
         Commands::Put { key, val } => {

@@ -68,21 +68,29 @@ impl Stash {
         key: &str,
         range_end: &str,
     ) -> Vec<(String, String)> {
-        let select_mode = match range_end {
-            key => SelectMode::One,
-            "" => SelectMode::Infinite,
-            _ => SelectMode::Range,
+        let select_mode = if range_end == key {
+            SelectMode::One
+        } else if range_end == "" {
+            SelectMode::Infinite
+        } else {
+            SelectMode::Range
         };
+
         let mut res = vec![];
         let key = key.to_string();
+
+        if select_mode == SelectMode::One {
+            if let Some(v) = tree.get(&key) {
+                return vec![(key.to_string(), v.clone())];
+            } else {
+                return vec![];
+            }
+        }
 
         for (k, v) in tree.iter() {
             let item_key = String::from_utf8_lossy(&k).to_string();
             if item_key.len() < key.len() {
                 continue;
-            }
-            if select_mode == SelectMode::One && item_key == key {
-                return vec![(item_key, v.clone())];
             }
 
             if item_key >= key {

@@ -1,6 +1,6 @@
 [package]
 name = "galadh"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Simple key-value storage inspired by etcd"
 license = "Apache-2.0"
@@ -22,9 +22,9 @@ tonic = "0.6.2"
 tonic-build = "0.6.2"
 
 [[bin]]
-name = "gld"
+name = "gldh"
 path = "src/server.rs"
 
 [[bin]]
-name = "gldctl"
+name = "gldh-cli"
 path = "src/client.rs"
