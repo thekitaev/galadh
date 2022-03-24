@@ -17,10 +17,10 @@ pub(crate) fn read_key_val(key: Vec<u8>, val: Vec<u8>) -> Result<(String, String
 
     Ok((key, val))
 }
-pub(crate) fn create_kv(key: &str, val: &str, lease: i64) -> KeyValue {
+pub(crate) fn create_kv(key: &str, val: &str) -> KeyValue {
     KeyValue {
         key: key.into(),
         value: val.into(),
-        lease: lease,
+        lease: 0,
     }
 }

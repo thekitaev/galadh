@@ -1,13 +1,13 @@
-use prefix_tree::PrefixMap;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use futures::Stream;
+use tokio::sync::Mutex;
 use tokio::sync::broadcast;
-use tokio::sync::{Mutex, MutexGuard};
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::proto::galadh::kv_server::Kv;
-use crate::proto::galadh::lease_server::Lease;
-use crate::proto::galadh::watch_request::RequestUnion;
-use crate::proto::galadh::watch_server::Watch;
-use crate::proto::galadh::Event;
+use utils::{create_kv, read_key_val};
+
 use crate::proto::galadh::{
     DeleteRangeRequest, DeleteRangeResponse, KeyValue, LeaseGrantRequest, LeaseGrantResponse,
     LeaseKeepAliveRequest, LeaseKeepAliveResponse, LeaseLeasesRequest, LeaseLeasesResponse,
@@ -15,29 +15,27 @@ use crate::proto::galadh::{
     PutRequest, PutResponse, RangeRequest, RangeResponse, TxnRequest, TxnResponse, WatchRequest,
     WatchResponse,
 };
+use crate::proto::galadh::Event;
+use crate::proto::galadh::kv_server::Kv;
+use crate::proto::galadh::lease_server::Lease;
+use crate::proto::galadh::watch_server::Watch;
+use crate::trie::TrieMap;
+
 mod utils;
 
-use utils::{create_kv, read_key_val};
-
-use futures::Stream;
-use std::pin::Pin;
-use std::sync::Arc;
-
-type Tree = PrefixMap<u8, String>;
-
 pub struct Stash {
-    tree: Arc<Mutex<Tree>>,
+    tree: Arc<Mutex<TrieMap>>,
     tx: broadcast::Sender<Event>,
     rx: broadcast::Receiver<Event>,
 }
 
 impl Stash {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         let (tx, rx) = broadcast::channel::<Event>(100);
         Self {
-            tree: Arc::new(Mutex::new(PrefixMap::new())),
-            rx,
+            tree: Arc::new(Mutex::new(TrieMap::new())),
             tx,
+            rx,
         }
     }
 
@@ -61,55 +59,6 @@ impl Stash {
             log::error!("err publishing event '{:?}': {}", event, e)
         }
     }
-
-    fn find_range(
-        &self,
-        tree: &MutexGuard<Tree>,
-        key: &str,
-        range_end: &str,
-    ) -> Vec<(String, String)> {
-        let select_mode = if range_end == key {
-            SelectMode::One
-        } else if range_end == "" {
-            SelectMode::Infinite
-        } else {
-            SelectMode::Range
-        };
-
-        let mut res = vec![];
-        let key = key.to_string();
-
-        if select_mode == SelectMode::One {
-            if let Some(v) = tree.get(&key) {
-                return vec![(key.to_string(), v.clone())];
-            } else {
-                return vec![];
-            }
-        }
-
-        for (k, v) in tree.iter() {
-            let item_key = String::from_utf8_lossy(&k).to_string();
-            if item_key.len() < key.len() {
-                continue;
-            }
-
-            if item_key >= key {
-                res.push((item_key.clone(), v.clone()))
-            }
-
-            if select_mode != SelectMode::Infinite && item_key.len() > range_end.len() {
-                break;
-            }
-        }
-        res
-    }
-}
-
-#[derive(PartialEq, Eq)]
-enum SelectMode {
-    One,
-    Range,
-    Infinite,
 }
 
 #[tonic::async_trait]
@@ -132,26 +81,38 @@ impl Kv for Stash {
 
         let tree = self.tree.lock().await;
         let mut count = 0;
-
+        let mut total = 0;
         let mut kvs = vec![];
-        let matches: Vec<_> = self.find_range(&tree, key.as_str(), range_end.as_str());
 
-        for item in &matches {
-            let (k, v) = item;
-
-            let kv: Option<KeyValue> = match (req.keys_only, req.count_only) {
-                (true, true) => return Err(Status::unknown("bad request")),
-                (true, false) => Some(create_kv(&k, "", 0)),
-                (false, true) => None,
-                (false, false) => Some(create_kv(&k, &v, 0)),
-            };
-            if let Some(kv) = kv {
-                kvs.push(kv)
-            };
-            count += 1
+        if key == range_end {
+            let res = tree.get(key.as_str());
+            if let Some(res) = res {
+                kvs.push(create_kv(res.0.as_str(), res.1.as_str()));
+                total = 1
+            }
+        } else {
+            let matches = tree.traverse();
+            log::info!("found {}", matches.len());
+            for item in &matches {
+                if item.0 < key || (!range_end.is_empty() && item.0 > range_end){
+                    log::info!("skipping");
+                    continue
+                }
+                let kv: Option<KeyValue> = match (req.keys_only, req.count_only) {
+                    (true, true) => return Err(Status::unknown("bad request")),
+                    (true, false) => Some(create_kv(item.0.as_str(), "")),
+                    (false, true) => None,
+                    (false, false) => Some(create_kv(item.0.as_str(), item.1.as_str())),
+                };
+                if let Some(kv) = kv {
+                    kvs.push(kv)
+                };
+                count += 1;
+            }
+            total = matches.len() as i64;
         }
 
-        let total = matches.len() as i64;
+        log::info!("returned {} items", kvs.len());
 
         Ok(Response::new(RangeResponse {
             kvs,
@@ -175,14 +136,14 @@ impl Kv for Stash {
 
         let mut tree = self.tree.lock().await;
 
-        let old_val = tree.insert(&key, val.clone());
+        let old_val = tree.put(&key, val.as_str());
         let prev_kv = match (old_val, req.prev_kv) {
-            (Some(v), true) => Some(create_kv(&key, &v, 0)),
+            (Some(v), true) => Some(create_kv(&v.0, &v.1)),
             (_, _) => None,
         };
 
         self.send_put(
-            Some(create_kv(key.as_str(), val.as_str(), 0)),
+            Some(create_kv(key.as_str(), val.as_str())),
             prev_kv.clone(),
         );
 
@@ -213,17 +174,15 @@ impl Kv for Stash {
         );
 
         let mut tree = self.tree.lock().await;
-        let matches: Vec<_> = self.find_range(&tree, key.as_str(), range_end.as_str());
+        let matches = tree.traverse();
 
         let mut prev_kvs = vec![];
         let mut count = 0;
 
         for item in matches {
-            let (k, v) = item;
-
-            tree.remove(&k);
+            tree.delete(item.0.as_str());
             count += 1;
-            prev_kvs.push(create_kv(&k, &v, 0));
+            prev_kvs.push(create_kv(item.0.as_str(), item.1.as_str()));
         }
 
         for kv in &prev_kvs {
@@ -236,7 +195,7 @@ impl Kv for Stash {
         }))
     }
 
-    async fn txn(&self, request: Request<TxnRequest>) -> Result<Response<TxnResponse>, Status> {
+    async fn txn(&self, _request: Request<TxnRequest>) -> Result<Response<TxnResponse>, Status> {
         todo!()
     }
 }
@@ -245,38 +204,38 @@ impl Kv for Stash {
 impl Lease for Stash {
     async fn lease_grant(
         &self,
-        request: Request<LeaseGrantRequest>,
+        _request: Request<LeaseGrantRequest>,
     ) -> Result<Response<LeaseGrantResponse>, Status> {
         todo!()
     }
 
     async fn lease_revoke(
         &self,
-        request: Request<LeaseRevokeRequest>,
+        _request: Request<LeaseRevokeRequest>,
     ) -> Result<Response<LeaseRevokeResponse>, Status> {
         todo!()
     }
 
     type LeaseKeepAliveStream =
-        Pin<Box<dyn Stream<Item = Result<LeaseKeepAliveResponse, Status>> + Send>>;
+    Pin<Box<dyn Stream<Item=Result<LeaseKeepAliveResponse, Status>> + Send>>;
 
     async fn lease_keep_alive(
         &self,
-        request: Request<Streaming<LeaseKeepAliveRequest>>,
+        _request: Request<Streaming<LeaseKeepAliveRequest>>,
     ) -> Result<Response<Self::LeaseKeepAliveStream>, Status> {
         todo!()
     }
 
     async fn lease_time_to_live(
         &self,
-        request: Request<LeaseTimeToLiveRequest>,
+        _request: Request<LeaseTimeToLiveRequest>,
     ) -> Result<Response<LeaseTimeToLiveResponse>, Status> {
         todo!()
     }
 
     async fn lease_leases(
         &self,
-        request: Request<LeaseLeasesRequest>,
+        _request: Request<LeaseLeasesRequest>,
     ) -> Result<Response<LeaseLeasesResponse>, Status> {
         todo!()
     }
@@ -284,37 +243,12 @@ impl Lease for Stash {
 
 #[tonic::async_trait]
 impl Watch for Stash {
-    type WatchStream = Pin<Box<dyn Stream<Item = Result<WatchResponse, Status>> + Send>>;
+    type WatchStream = Pin<Box<dyn Stream<Item=Result<WatchResponse, Status>> + Send>>;
 
     async fn watch(
         &self,
-        request: Request<Streaming<WatchRequest>>,
+        _request: Request<Streaming<WatchRequest>>,
     ) -> Result<Response<Self::WatchStream>, Status> {
-        let mut req = request.into_inner();
-
-        loop {
-            let msg = req.message().await;
-            if let Ok(msg) = msg {
-                if let Some(msg) = msg {
-                    if let Some(ru) = msg.request_union {
-                        match ru {
-                            RequestUnion::CreateRequest(r) => {
-                                let (key, range_end) = match read_key_val(r.key, r.range_end) {
-                                    Err(e) => {
-                                        log::error!("error reading key-range_end: {}", e);
-                                        return Err(Status::unknown(e.to_string()));
-                                    }
-                                    Ok((k, v)) => (k, v),
-                                };
-                            }
-                            RequestUnion::CancelRequest(r) => todo!(),
-                            RequestUnion::ProgressRequest(r) => todo!(),
-                        };
-                    }
-                }
-            }
-        }
-        let rx = self.tx.subscribe();
         todo!()
     }
 }

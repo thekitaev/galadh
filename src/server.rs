@@ -1,16 +1,15 @@
 mod proto;
 mod stash;
+mod trie;
 
 use crate::proto::galadh::kv_server::KvServer;
 use crate::stash::Stash;
-use env_logger;
-use log;
 use std::env;
-use tonic::{transport::Server, Request, Response, Status};
+use tonic::transport::Server;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if let Err(_) = env::var("RUST_LOG") {
+    if env::var("RUST_LOG").is_err() {
         env::set_var("RUST_LOG", "info")
     }
     env_logger::init();

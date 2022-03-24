@@ -1,4 +1,4 @@
-use tonic_build;
+//use tonic_build;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all("src/proto")?;

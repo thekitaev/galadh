@@ -1,3 +1,4 @@
 mod proto;
 mod stash;
-mod utils;
+
+pub mod trie;
