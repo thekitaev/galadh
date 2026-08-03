@@ -26,10 +26,12 @@ mod utils;
 pub struct Stash {
     tree: Arc<Mutex<TrieMap>>,
     tx: broadcast::Sender<Event>,
+    #[allow(dead_code)]
     rx: broadcast::Receiver<Event>,
 }
 
 impl Stash {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         let (tx, rx) = broadcast::channel::<Event>(100);
         Self {
@@ -94,7 +96,10 @@ impl Kv for Stash {
             let matches = tree.traverse();
             log::info!("found {}", matches.len());
             for item in &matches {
-                if item.0 < key || (!range_end.is_empty() && item.0 > range_end){
+                if item.0 < key
+                    || (!range_end.is_empty() && item.0 > range_end)
+                    || (range_end.is_empty() && !item.0.starts_with(&key))
+                {
                     log::info!("skipping");
                     continue
                 }
@@ -174,15 +179,31 @@ impl Kv for Stash {
         );
 
         let mut tree = self.tree.lock().await;
-        let matches = tree.traverse();
 
         let mut prev_kvs = vec![];
-        let mut count = 0;
+        let mut count: i64 = 0;
 
-        for item in matches {
-            tree.delete(item.0.as_str());
-            count += 1;
-            prev_kvs.push(create_kv(item.0.as_str(), item.1.as_str()));
+        if key == range_end {
+            let old = tree.get(key.as_str());
+            if let Some(kv) = old {
+                tree.delete(key.as_str());
+                count = 1;
+                prev_kvs.push(create_kv(kv.0.as_str(), kv.1.as_str()));
+            }
+        } else {
+            let matches = tree.traverse();
+            log::info!("found {} candidates to delete", matches.len());
+            for item in matches {
+                if item.0 < key
+                    || (!range_end.is_empty() && item.0 > range_end)
+                    || (range_end.is_empty() && !item.0.starts_with(&key))
+                {
+                    continue;
+                }
+                tree.delete(item.0.as_str());
+                count += 1;
+                prev_kvs.push(create_kv(item.0.as_str(), item.1.as_str()));
+            }
         }
 
         for kv in &prev_kvs {
@@ -255,21 +276,165 @@ impl Watch for Stash {
 
 #[cfg(test)]
 mod tests {
-    use prefix_tree::PrefixMap;
+    use tonic::Request;
 
-    use crate::stash::Stash;
+    use crate::proto::galadh::kv_server::Kv;
+    use crate::proto::galadh::{DeleteRangeRequest, PutRequest, RangeRequest};
 
-    #[test]
-    fn test_tree_sorted() {
-        let mut tree = PrefixMap::new();
-        let mut keys = vec!["abc", "def", "abb", "aba", "zxy"];
-        for k in &keys {
-            tree.insert(*k, "value".to_string());
+    use super::Stash;
+
+    async fn seed_stash(stash: &Stash) {
+        let keys = vec!["ab", "abc", "abd", "ac", "zzz"];
+        for k in keys {
+            stash
+                .put(Request::new(PutRequest {
+                    key: k.into(),
+                    value: format!("v_{k}").into_bytes(),
+                    lease: 0,
+                    prev_kv: false,
+                    ignore_value: false,
+                    ignore_lease: false,
+                }))
+                .await
+                .unwrap();
         }
-        keys.sort();
+    }
 
-        for (i, k) in tree.keys().enumerate() {
-            assert_eq!(String::from_utf8_lossy(&k), keys[i].to_string())
-        }
+    #[tokio::test]
+    async fn test_range_prefix_only_returns_matching_keys() {
+        let stash = Stash::new();
+        seed_stash(&stash).await;
+
+        let resp = stash
+            .range(Request::new(RangeRequest {
+                key: b"ab".to_vec(),
+                range_end: vec![],
+                limit: 100,
+                sort_order: 0,
+                sort_target: 0,
+                keys_only: false,
+                count_only: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let returned: Vec<String> = resp
+            .kvs
+            .iter()
+            .map(|kv| String::from_utf8(kv.key.clone()).unwrap())
+            .collect();
+        assert_eq!(returned, vec!["ab", "abc", "abd"]);
+    }
+
+    #[tokio::test]
+    async fn test_range_exact_key_returns_one() {
+        let stash = Stash::new();
+        seed_stash(&stash).await;
+
+        let resp = stash
+            .range(Request::new(RangeRequest {
+                key: b"ac".to_vec(),
+                range_end: b"ac".to_vec(),
+                limit: 100,
+                sort_order: 0,
+                sort_target: 0,
+                keys_only: false,
+                count_only: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(resp.kvs.len(), 1);
+        assert_eq!(
+            String::from_utf8(resp.kvs[0].key.clone()).unwrap(),
+            "ac"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_range_prefix_only_deletes_matching() {
+        let stash = Stash::new();
+        seed_stash(&stash).await;
+
+        let del_resp = stash
+            .delete_range(Request::new(DeleteRangeRequest {
+                key: b"ab".to_vec(),
+                range_end: vec![],
+                prev_kv: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(del_resp.deleted, 3);
+        let deleted: Vec<String> = del_resp
+            .prev_kvs
+            .iter()
+            .map(|kv| String::from_utf8(kv.key.clone()).unwrap())
+            .collect();
+        assert_eq!(deleted, vec!["ab", "abc", "abd"]);
+
+        // surviving keys: "ac", "zzz"
+        let get_resp = stash
+            .range(Request::new(RangeRequest {
+                key: b"a".to_vec(),
+                range_end: vec![],
+                limit: 100,
+                sort_order: 0,
+                sort_target: 0,
+                keys_only: false,
+                count_only: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let remaining: Vec<String> = get_resp
+            .kvs
+            .iter()
+            .map(|kv| String::from_utf8(kv.key.clone()).unwrap())
+            .collect();
+        assert_eq!(remaining, vec!["ac"]);
+    }
+
+    #[tokio::test]
+    async fn test_delete_range_exact_key_deletes_one() {
+        let stash = Stash::new();
+        seed_stash(&stash).await;
+
+        let del_resp = stash
+            .delete_range(Request::new(DeleteRangeRequest {
+                key: b"zzz".to_vec(),
+                range_end: b"zzz".to_vec(),
+                prev_kv: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(del_resp.deleted, 1);
+        assert_eq!(
+            String::from_utf8(del_resp.prev_kvs[0].key.clone()).unwrap(),
+            "zzz"
+        );
+
+        // verify it's gone
+        let get_resp = stash
+            .range(Request::new(RangeRequest {
+                key: b"zzz".to_vec(),
+                range_end: b"zzz".to_vec(),
+                limit: 100,
+                sort_order: 0,
+                sort_target: 0,
+                keys_only: false,
+                count_only: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(get_resp.kvs.is_empty());
     }
 }

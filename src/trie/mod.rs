@@ -34,10 +34,9 @@ impl TrieNode {
         }
         if let Entry::Vacant(e) = self.children.entry(key_end[0]) {
             let mut new_node = TrieNode::new();
-            new_node.put(full_key, &key_end[1..], value);
+            let result = new_node.put(full_key, &key_end[1..], value);
             e.insert(new_node);
-            
-            Some(KVPair(full_key.to_string(), value.to_string()))
+            result
         } else {
             self.children
                 .get_mut(&key_end[0])
@@ -159,7 +158,7 @@ mod tests {
         let out = trie.traverse();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, "key".to_string());
-        
+
         let all_keys = vec!["key_0", "key_3", "key_2", "key_4", "key_30"];
         for k in all_keys.iter() {
             trie.put(k, "value");
@@ -175,5 +174,81 @@ mod tests {
         for (i, w) in want.iter().enumerate() {
             assert_eq!(have[i].0, w.to_string());
         }
+    }
+
+    #[test]
+    fn test_trie_put_new_key_returns_none() {
+        let mut trie = TrieMap::new();
+        assert!(trie.put("abc", "def").is_none());
+    }
+
+    #[test]
+    fn test_trie_put_existing_key_returns_old_value() {
+        let mut trie = TrieMap::new();
+        trie.put("abc", "def");
+        let old = trie.put("abc", "xyz");
+        assert_eq!(old, Some(KVPair("abc".to_string(), "def".to_string())));
+    }
+
+    #[test]
+    fn test_trie_put_prefix_keys_returns_none() {
+        let mut trie = TrieMap::new();
+        trie.put("abc", "def");
+        let old = trie.put("ab", "value");
+        assert!(old.is_none());
+    }
+
+    #[test]
+    fn test_prefix_filter() {
+        let mut trie = TrieMap::new();
+        trie.put("ab", "v1");
+        trie.put("abc", "v2");
+        trie.put("abd", "v3");
+        trie.put("ac", "v4");
+        trie.put("zzz", "v5");
+
+        let prefix = "ab".to_string();
+        let matches = trie.traverse();
+        let filtered: Vec<_> = matches
+            .iter()
+            .filter(|item| {
+                !(item.0 < prefix
+                    || (!"".is_empty() && item.0 > "".to_string())
+                    || ("".is_empty() && !item.0.starts_with(&prefix)))
+            })
+            .collect();
+        assert_eq!(filtered.len(), 3);
+        assert_eq!(filtered[0].0, "ab");
+        assert_eq!(filtered[1].0, "abc");
+        assert_eq!(filtered[2].0, "abd");
+    }
+
+    #[test]
+    fn test_delete_prefix_only_deletes_matching_keys() {
+        let mut trie = TrieMap::new();
+        trie.put("ab", "v1");
+        trie.put("abc", "v2");
+        trie.put("ac", "v3");
+        trie.put("zzz", "v4");
+
+        let prefix = "ab".to_string();
+        let matches = trie.traverse();
+        let to_delete: Vec<_> = matches
+            .into_iter()
+            .filter(|item| {
+                !(item.0 < prefix
+                    || (!"".is_empty() && item.0 > "".to_string())
+                    || ("".is_empty() && !item.0.starts_with(&prefix)))
+            })
+            .collect();
+
+        for kv in &to_delete {
+            trie.delete(kv.0.as_str());
+        }
+
+        let remaining = trie.traverse();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].0, "ac");
+        assert_eq!(remaining[1].0, "zzz");
     }
 }
