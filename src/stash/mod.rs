@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -23,21 +24,52 @@ use crate::trie::TrieMap;
 
 mod utils;
 
+#[derive(Clone)]
 pub struct Stash {
     tree: Arc<Mutex<TrieMap>>,
     tx: broadcast::Sender<Event>,
-    #[allow(dead_code)]
-    rx: broadcast::Receiver<Event>,
+    snapshot: Option<PathBuf>,
 }
 
 impl Stash {
     #[allow(dead_code)]
     pub fn new() -> Self {
-        let (tx, rx) = broadcast::channel::<Event>(100);
+        let (tx, _rx) = broadcast::channel::<Event>(100);
         Self {
             tree: Arc::new(Mutex::new(TrieMap::new())),
             tx,
-            rx,
+            snapshot: None,
+        }
+    }
+
+    /// Create a Stash persisted to `path`: the snapshot is loaded on start
+    /// and rewritten atomically after every successful mutation.
+    #[allow(dead_code)]
+    pub fn with_snapshot(path: PathBuf) -> std::io::Result<Self> {
+        let mut tree = TrieMap::new();
+        if path.exists() {
+            let kvs = utils::load_snapshot(&path)?;
+            log::info!("loaded {} keys from snapshot {:?}", kvs.len(), path);
+            for kv in kvs {
+                tree.put(&kv.0, &kv.1);
+            }
+        } else if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let (tx, _rx) = broadcast::channel::<Event>(100);
+        Ok(Self {
+            tree: Arc::new(Mutex::new(tree)),
+            tx,
+            snapshot: Some(path),
+        })
+    }
+
+    fn persist(&self, tree: &TrieMap) {
+        if let Some(path) = &self.snapshot {
+            let kvs = tree.traverse();
+            if let Err(e) = utils::save_snapshot(path, &kvs) {
+                log::error!("failed to write snapshot {:?}: {}", path, e);
+            }
         }
     }
 
@@ -74,55 +106,59 @@ impl Kv for Stash {
         let (key, range_end) = match read_key_val(req.key, req.range_end) {
             Err(e) => {
                 log::error!("error reading key-range_end: {}", e);
-                return Err(Status::unknown(e.to_string()));
+                return Err(Status::invalid_argument(e.to_string()));
             }
             Ok((k, v)) => (k, v),
         };
 
+        if req.keys_only && req.count_only {
+            return Err(Status::invalid_argument(
+                "keys_only and count_only cannot be set together",
+            ));
+        }
+
         log::info!("GET: key '{}', range_end '{}'", key, range_end);
 
         let tree = self.tree.lock().await;
-        let mut count = 0;
-        let mut total = 0;
         let mut kvs = vec![];
 
-        if key == range_end {
-            let res = tree.get(key.as_str());
-            if let Some(res) = res {
-                kvs.push(create_kv(res.0.as_str(), res.1.as_str()));
-                total = 1
-            }
+        // etcd semantics:
+        // - range_end empty: look up the single key
+        // - range_end == "\0": all keys >= key
+        // - otherwise: [key, range_end), upper bound exclusive
+        let matches: Vec<_> = if range_end.is_empty() {
+            tree.get(key.as_str()).into_iter().collect()
+        } else if range_end == "\0" {
+            tree.scan(&key, None)
         } else {
-            let matches = tree.traverse();
-            log::info!("found {}", matches.len());
-            for item in &matches {
-                if item.0 < key
-                    || (!range_end.is_empty() && item.0 > range_end)
-                    || (range_end.is_empty() && !item.0.starts_with(&key))
-                {
-                    log::info!("skipping");
-                    continue
-                }
-                let kv: Option<KeyValue> = match (req.keys_only, req.count_only) {
-                    (true, true) => return Err(Status::unknown("bad request")),
-                    (true, false) => Some(create_kv(item.0.as_str(), "")),
-                    (false, true) => None,
-                    (false, false) => Some(create_kv(item.0.as_str(), item.1.as_str())),
-                };
-                if let Some(kv) = kv {
-                    kvs.push(kv)
-                };
-                count += 1;
+            tree.scan(&key, Some(&range_end))
+        };
+
+        let count = matches.len() as i64;
+        let limit = if req.limit > 0 {
+            Some(req.limit as usize)
+        } else {
+            None
+        };
+        let more = match limit {
+            Some(l) => count > l as i64,
+            None => false,
+        };
+
+        for item in matches.into_iter().take(limit.unwrap_or(usize::MAX)) {
+            if req.count_only {
+                continue;
             }
-            total = matches.len() as i64;
+            let value = if req.keys_only { "" } else { item.1.as_str() };
+            kvs.push(create_kv(item.0.as_str(), value));
         }
 
-        log::info!("returned {} items", kvs.len());
+        log::info!("returned {} items, count {}", kvs.len(), count);
 
         Ok(Response::new(RangeResponse {
             kvs,
-            more: total > count,
-            count: total,
+            more,
+            count,
         }))
     }
 
@@ -142,6 +178,7 @@ impl Kv for Stash {
         let mut tree = self.tree.lock().await;
 
         let old_val = tree.put(&key, val.as_str());
+        self.persist(&tree);
         let prev_kv = match (old_val, req.prev_kv) {
             (Some(v), true) => Some(create_kv(&v.0, &v.1)),
             (_, _) => None,
@@ -166,7 +203,7 @@ impl Kv for Stash {
         let (key, range_end) = match read_key_val(req.key, req.range_end) {
             Err(e) => {
                 log::error!("error reading key-range_end: {}", e);
-                return Err(Status::unknown(e.to_string()));
+                return Err(Status::invalid_argument(e.to_string()));
             }
             Ok((k, v)) => (k, v),
         };
@@ -181,30 +218,23 @@ impl Kv for Stash {
         let mut tree = self.tree.lock().await;
 
         let mut prev_kvs = vec![];
-        let mut count: i64 = 0;
 
-        if key == range_end {
-            let old = tree.get(key.as_str());
-            if let Some(kv) = old {
-                tree.delete(key.as_str());
-                count = 1;
-                prev_kvs.push(create_kv(kv.0.as_str(), kv.1.as_str()));
-            }
+        // same range semantics as range(): empty range_end deletes the single
+        // key, "\0" deletes all keys >= key, otherwise [key, range_end)
+        let matches: Vec<_> = if range_end.is_empty() {
+            tree.get(key.as_str()).into_iter().collect()
+        } else if range_end == "\0" {
+            tree.scan(&key, None)
         } else {
-            let matches = tree.traverse();
-            log::info!("found {} candidates to delete", matches.len());
-            for item in matches {
-                if item.0 < key
-                    || (!range_end.is_empty() && item.0 > range_end)
-                    || (range_end.is_empty() && !item.0.starts_with(&key))
-                {
-                    continue;
-                }
-                tree.delete(item.0.as_str());
-                count += 1;
-                prev_kvs.push(create_kv(item.0.as_str(), item.1.as_str()));
-            }
+            tree.scan(&key, Some(&range_end))
+        };
+
+        let count = matches.len() as i64;
+        for item in matches {
+            tree.delete(item.0.as_str());
+            prev_kvs.push(create_kv(item.0.as_str(), item.1.as_str()));
         }
+        self.persist(&tree);
 
         for kv in &prev_kvs {
             self.send_delete(None, Some(kv.clone()))
@@ -217,7 +247,7 @@ impl Kv for Stash {
     }
 
     async fn txn(&self, _request: Request<TxnRequest>) -> Result<Response<TxnResponse>, Status> {
-        todo!()
+        Err(Status::unimplemented("transactions are not implemented"))
     }
 }
 
@@ -227,14 +257,14 @@ impl Lease for Stash {
         &self,
         _request: Request<LeaseGrantRequest>,
     ) -> Result<Response<LeaseGrantResponse>, Status> {
-        todo!()
+        Err(Status::unimplemented("leases are not implemented"))
     }
 
     async fn lease_revoke(
         &self,
         _request: Request<LeaseRevokeRequest>,
     ) -> Result<Response<LeaseRevokeResponse>, Status> {
-        todo!()
+        Err(Status::unimplemented("leases are not implemented"))
     }
 
     type LeaseKeepAliveStream =
@@ -244,21 +274,21 @@ impl Lease for Stash {
         &self,
         _request: Request<Streaming<LeaseKeepAliveRequest>>,
     ) -> Result<Response<Self::LeaseKeepAliveStream>, Status> {
-        todo!()
+        Err(Status::unimplemented("leases are not implemented"))
     }
 
     async fn lease_time_to_live(
         &self,
         _request: Request<LeaseTimeToLiveRequest>,
     ) -> Result<Response<LeaseTimeToLiveResponse>, Status> {
-        todo!()
+        Err(Status::unimplemented("leases are not implemented"))
     }
 
     async fn lease_leases(
         &self,
         _request: Request<LeaseLeasesRequest>,
     ) -> Result<Response<LeaseLeasesResponse>, Status> {
-        todo!()
+        Err(Status::unimplemented("leases are not implemented"))
     }
 }
 
@@ -270,7 +300,7 @@ impl Watch for Stash {
         &self,
         _request: Request<Streaming<WatchRequest>>,
     ) -> Result<Response<Self::WatchStream>, Status> {
-        todo!()
+        Err(Status::unimplemented("watch is not implemented"))
     }
 }
 
@@ -282,6 +312,7 @@ mod tests {
     use crate::proto::galadh::{DeleteRangeRequest, PutRequest, RangeRequest};
 
     use super::Stash;
+    use super::utils::{load_snapshot, prefix_end};
 
     async fn seed_stash(stash: &Stash) {
         let keys = vec!["ab", "abc", "abd", "ac", "zzz"];
@@ -308,7 +339,7 @@ mod tests {
         let resp = stash
             .range(Request::new(RangeRequest {
                 key: b"ab".to_vec(),
-                range_end: vec![],
+                range_end: prefix_end(b"ab"),
                 limit: 100,
                 sort_order: 0,
                 sort_target: 0,
@@ -325,6 +356,80 @@ mod tests {
             .map(|kv| String::from_utf8(kv.key.clone()).unwrap())
             .collect();
         assert_eq!(returned, vec!["ab", "abc", "abd"]);
+        assert_eq!(resp.count, 3);
+        assert!(!resp.more);
+    }
+
+    #[tokio::test]
+    async fn test_range_prefix_limit_returns_more_flag() {
+        let stash = Stash::new();
+        seed_stash(&stash).await;
+
+        let resp = stash
+            .range(Request::new(RangeRequest {
+                key: b"ab".to_vec(),
+                range_end: prefix_end(b"ab"),
+                limit: 2,
+                sort_order: 0,
+                sort_target: 0,
+                keys_only: false,
+                count_only: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let returned: Vec<String> = resp
+            .kvs
+            .iter()
+            .map(|kv| String::from_utf8(kv.key.clone()).unwrap())
+            .collect();
+        assert_eq!(returned, vec!["ab", "abc"]);
+        assert_eq!(resp.count, 3);
+        assert!(resp.more);
+    }
+
+    #[tokio::test]
+    async fn test_range_count_only_returns_count_without_kvs() {
+        let stash = Stash::new();
+        seed_stash(&stash).await;
+
+        let resp = stash
+            .range(Request::new(RangeRequest {
+                key: b"ab".to_vec(),
+                range_end: prefix_end(b"ab"),
+                limit: 0,
+                sort_order: 0,
+                sort_target: 0,
+                keys_only: false,
+                count_only: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(resp.kvs.is_empty());
+        assert_eq!(resp.count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_range_keys_only_and_count_only_is_invalid_argument() {
+        let stash = Stash::new();
+        seed_stash(&stash).await;
+
+        let resp = stash
+            .range(Request::new(RangeRequest {
+                key: b"ab".to_vec(),
+                range_end: prefix_end(b"ab"),
+                limit: 0,
+                sort_order: 0,
+                sort_target: 0,
+                keys_only: true,
+                count_only: true,
+            }))
+            .await;
+
+        assert_eq!(resp.unwrap_err().code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]
@@ -335,7 +440,7 @@ mod tests {
         let resp = stash
             .range(Request::new(RangeRequest {
                 key: b"ac".to_vec(),
-                range_end: b"ac".to_vec(),
+                range_end: vec![],
                 limit: 100,
                 sort_order: 0,
                 sort_target: 0,
@@ -346,11 +451,88 @@ mod tests {
             .unwrap()
             .into_inner();
 
-        assert_eq!(resp.kvs.len(), 1);
+        assert_eq!(resp.count, 1);
         assert_eq!(
             String::from_utf8(resp.kvs[0].key.clone()).unwrap(),
             "ac"
         );
+    }
+
+    #[tokio::test]
+    async fn test_range_exact_missing_key_returns_empty() {
+        let stash = Stash::new();
+        seed_stash(&stash).await;
+
+        let resp = stash
+            .range(Request::new(RangeRequest {
+                key: b"nope".to_vec(),
+                range_end: vec![],
+                limit: 100,
+                sort_order: 0,
+                sort_target: 0,
+                keys_only: false,
+                count_only: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(resp.kvs.is_empty());
+        assert_eq!(resp.count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_range_upper_bound_is_exclusive() {
+        let stash = Stash::new();
+        seed_stash(&stash).await;
+
+        let resp = stash
+            .range(Request::new(RangeRequest {
+                key: b"ab".to_vec(),
+                range_end: b"abd".to_vec(),
+                limit: 0,
+                sort_order: 0,
+                sort_target: 0,
+                keys_only: false,
+                count_only: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let returned: Vec<String> = resp
+            .kvs
+            .iter()
+            .map(|kv| String::from_utf8(kv.key.clone()).unwrap())
+            .collect();
+        assert_eq!(returned, vec!["ab", "abc"]);
+    }
+
+    #[tokio::test]
+    async fn test_range_zero_range_end_returns_all_keys_from_key() {
+        let stash = Stash::new();
+        seed_stash(&stash).await;
+
+        let resp = stash
+            .range(Request::new(RangeRequest {
+                key: b"ac".to_vec(),
+                range_end: vec![0],
+                limit: 0,
+                sort_order: 0,
+                sort_target: 0,
+                keys_only: false,
+                count_only: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let returned: Vec<String> = resp
+            .kvs
+            .iter()
+            .map(|kv| String::from_utf8(kv.key.clone()).unwrap())
+            .collect();
+        assert_eq!(returned, vec!["ac", "zzz"]);
     }
 
     #[tokio::test]
@@ -361,7 +543,7 @@ mod tests {
         let del_resp = stash
             .delete_range(Request::new(DeleteRangeRequest {
                 key: b"ab".to_vec(),
-                range_end: vec![],
+                range_end: prefix_end(b"ab"),
                 prev_kv: true,
             }))
             .await
@@ -380,7 +562,7 @@ mod tests {
         let get_resp = stash
             .range(Request::new(RangeRequest {
                 key: b"a".to_vec(),
-                range_end: vec![],
+                range_end: prefix_end(b"a"),
                 limit: 100,
                 sort_order: 0,
                 sort_target: 0,
@@ -407,7 +589,7 @@ mod tests {
         let del_resp = stash
             .delete_range(Request::new(DeleteRangeRequest {
                 key: b"zzz".to_vec(),
-                range_end: b"zzz".to_vec(),
+                range_end: vec![],
                 prev_kv: true,
             }))
             .await
@@ -424,7 +606,7 @@ mod tests {
         let get_resp = stash
             .range(Request::new(RangeRequest {
                 key: b"zzz".to_vec(),
-                range_end: b"zzz".to_vec(),
+                range_end: vec![],
                 limit: 100,
                 sort_order: 0,
                 sort_target: 0,
@@ -436,5 +618,157 @@ mod tests {
             .into_inner();
 
         assert!(get_resp.kvs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("galadh-test-{}", std::process::id()));
+        let path = dir.join("galadh.snapshot");
+
+        let stash = Stash::with_snapshot(path.clone()).unwrap();
+        seed_stash(&stash).await;
+
+        // the snapshot file now contains all 5 seeded keys
+        let kvs = load_snapshot(&path).unwrap();
+        assert_eq!(kvs.len(), 5);
+
+        // a fresh Stash over the same file restores the data
+        let stash2 = Stash::with_snapshot(path.clone()).unwrap();
+        let resp = stash2
+            .range(Request::new(RangeRequest {
+                key: b"ab".to_vec(),
+                range_end: prefix_end(b"ab"),
+                limit: 0,
+                sort_order: 0,
+                sort_target: 0,
+                keys_only: false,
+                count_only: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.count, 3);
+
+        // deletions persist too
+        stash2
+            .delete_range(Request::new(DeleteRangeRequest {
+                key: b"ab".to_vec(),
+                range_end: prefix_end(b"ab"),
+                prev_kv: false,
+            }))
+            .await
+            .unwrap();
+        let stash3 = Stash::with_snapshot(path).unwrap();
+        let resp = stash3
+            .range(Request::new(RangeRequest {
+                key: b"a".to_vec(),
+                range_end: prefix_end(b"a"),
+                limit: 0,
+                sort_order: 0,
+                sort_target: 0,
+                keys_only: false,
+                count_only: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.count, 1); // only "ac" remains
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_load_snapshot_rejects_bogus_length_prefix() {
+        let dir = std::env::temp_dir().join(format!("galadh-test-evil-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("evil.snapshot");
+        // key length prefix of u64::MAX followed by a few bytes: a corrupt
+        // snapshot must be rejected with InvalidData, not panic the loader
+        let mut buf = vec![0xFFu8; 8];
+        buf.extend_from_slice(b"key");
+        std::fs::write(&path, buf).unwrap();
+
+        let err = load_snapshot(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_unimplemented_rpcs_return_status() {
+        use crate::proto::galadh::lease_server::Lease;
+        use crate::proto::galadh::{
+            LeaseGrantRequest, LeaseRevokeRequest, LeaseTimeToLiveRequest, LeaseLeasesRequest,
+            TxnRequest,
+        };
+
+        let stash = Stash::new();
+
+        let resp = stash.txn(Request::new(TxnRequest::default())).await;
+        assert_eq!(resp.unwrap_err().code(), tonic::Code::Unimplemented);
+
+        let resp = stash
+            .lease_grant(Request::new(LeaseGrantRequest::default()))
+            .await;
+        assert_eq!(resp.unwrap_err().code(), tonic::Code::Unimplemented);
+
+        let resp = stash
+            .lease_revoke(Request::new(LeaseRevokeRequest::default()))
+            .await;
+        assert_eq!(resp.unwrap_err().code(), tonic::Code::Unimplemented);
+
+        let resp = stash
+            .lease_time_to_live(Request::new(LeaseTimeToLiveRequest::default()))
+            .await;
+        assert_eq!(resp.unwrap_err().code(), tonic::Code::Unimplemented);
+
+        let resp = stash
+            .lease_leases(Request::new(LeaseLeasesRequest::default()))
+            .await;
+        assert_eq!(resp.unwrap_err().code(), tonic::Code::Unimplemented);
+    }
+
+    /// Streaming rpcs cannot be called directly (tonic's `Streaming` type is
+    /// not constructible outside the transport), so run a real in-process
+    /// server and hit watch/lease_keep_alive over the wire.
+    #[tokio::test]
+    async fn test_streaming_rpcs_unimplemented_over_grpc() {
+        use crate::proto::galadh::lease_server::LeaseServer;
+        use crate::proto::galadh::lease_client::LeaseClient;
+        use crate::proto::galadh::watch_server::WatchServer;
+        use crate::proto::galadh::watch_client::WatchClient;
+        use crate::proto::galadh::{LeaseKeepAliveRequest, WatchRequest};
+
+        let stash = Stash::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(LeaseServer::new(stash.clone()))
+                .add_service(WatchServer::new(stash))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        let mut lease = LeaseClient::connect(format!("http://{addr}")).await.unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            tx.send(LeaseKeepAliveRequest::default()).await.unwrap();
+        });
+        let resp = lease
+            .lease_keep_alive(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await;
+        assert_eq!(resp.unwrap_err().code(), tonic::Code::Unimplemented);
+
+        let mut watch = WatchClient::connect(format!("http://{addr}")).await.unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            tx.send(WatchRequest::default()).await.unwrap();
+        });
+        let resp = watch
+            .watch(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await;
+        assert_eq!(resp.unwrap_err().code(), tonic::Code::Unimplemented);
     }
 }
