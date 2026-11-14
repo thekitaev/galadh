@@ -49,11 +49,14 @@ Smoke test by hand:
 
 ## Known limitations (open work, don't "fix" silently)
 
-- No persistence: restart wipes data.
-- Range scans traverse the whole trie and filter afterwards — O(all keys).
+- Persistence is snapshot-per-write (`--data-dir`): the whole trie is rewritten on every
+  mutation — fine for alpha, not for large datasets or high write rates.
 - Keys/values are `String`s: non-UTF-8 (binary) keys are rejected, unlike etcd.
-- No CI, no branch protection. `main` should stay green: run `cargo test` before pushing.
-- Server address is hardcoded; no config flags yet.
+- Range scans use `TrieMap::scan` with subtree pruning, but still build the full result
+  vector before applying `limit`.
+- No branch protection. `main` should stay green: run `cargo test` and
+  `cargo clippy --all-targets -- -D warnings` before pushing (CI enforces both).
+- Server binds `127.0.0.1:2379` by default; override with `--addr` (`--data-dir` enables persistence).
 
 ## Conventions
 
