@@ -135,15 +135,15 @@ impl TrieNode {
             }
         }
 
-        let path_str = String::from_utf8_lossy(path).into_owned();
         for (byte, child) in &self.children {
             path.push(*byte);
 
-            // every key in this subtree has `path` as a prefix, hence is >= path;
-            // prune when even the smallest possible key is past the upper bound
-            let past_upper = to
-                .map(|t| path_str.as_str() >= t)
-                .unwrap_or(false);
+            // every key in this subtree starts with `path` and is therefore
+            // >= path; prune when even the smallest possible key is past the
+            // exclusive upper bound. Compare raw bytes: `path` may end in the
+            // middle of a multi-byte UTF-8 character, and a lossy str
+            // conversion would reorder it (U+FFFD sorts above most bytes).
+            let past_upper = to.is_some_and(|t| path.as_slice() >= t.as_bytes());
             // prune when no key in the subtree can reach `from`: path < from
             // and the difference is not inside the path itself
             let before_lower = path.as_slice() < from
@@ -307,6 +307,20 @@ mod tests {
         let have = trie.scan("b", Some("bc"));
         let keys: Vec<_> = have.iter().map(|kv| kv.0.as_str()).collect();
         assert_eq!(keys, vec!["b", "ba", "bb"]);
+    }
+
+    #[test]
+    fn test_scan_multibyte_utf8_range() {
+        // Cyrillic keys are multi-byte in UTF-8: "a"..="z" analogs here are
+        // \u{0430}..\u{044F}, all two-byte sequences starting with 0xD0/0xD1.
+        let mut trie = TrieMap::new();
+        trie.put("аб", "v1"); // a-b
+        trie.put("ав", "v2"); // a-v
+        trie.put("яб", "v3"); // ya-b, past the upper bound
+
+        let have = trie.scan("а", Some("я"));
+        let keys: Vec<_> = have.iter().map(|kv| kv.0.as_str()).collect();
+        assert_eq!(keys, vec!["аб", "ав"]);
     }
 
     #[test]

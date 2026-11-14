@@ -37,25 +37,33 @@ pub(crate) fn load_snapshot(path: &Path) -> std::io::Result<Vec<KVPair>> {
     let buf = std::fs::read(path)?;
     let mut kvs = Vec::new();
     let mut pos = 0usize;
+
+    // Reads a u64 length prefix at `pos` and checks it against the bytes
+    // actually left in the buffer, so a corrupt length prefix is rejected
+    // instead of overflowing usize or panicking on a wrapped slice range.
+    fn next_len(buf: &[u8], pos: &mut usize, what: &str) -> std::io::Result<usize> {
+        if *pos + 8 > buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("truncated {what} length"),
+            ));
+        }
+        let n = u64::from_le_bytes(buf[*pos..*pos + 8].try_into().unwrap());
+        *pos += 8;
+        if n > (buf.len() - *pos) as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("truncated {what}"),
+            ));
+        }
+        Ok(n as usize)
+    }
+
     while pos < buf.len() {
-        if pos + 8 > buf.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated key length"));
-        }
-        let key_len = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap()) as usize;
-        pos += 8;
-        if pos + key_len > buf.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated key"));
-        }
+        let key_len = next_len(&buf, &mut pos, "key")?;
         let key = String::from_utf8_lossy(&buf[pos..pos + key_len]).into_owned();
         pos += key_len;
-        if pos + 8 > buf.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated value length"));
-        }
-        let val_len = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap()) as usize;
-        pos += 8;
-        if pos + val_len > buf.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated value"));
-        }
+        let val_len = next_len(&buf, &mut pos, "value")?;
         let val = String::from_utf8_lossy(&buf[pos..pos + val_len]).into_owned();
         pos += val_len;
         kvs.push(KVPair(key, val));

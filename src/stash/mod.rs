@@ -677,6 +677,23 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn test_load_snapshot_rejects_bogus_length_prefix() {
+        let dir = std::env::temp_dir().join(format!("galadh-test-evil-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("evil.snapshot");
+        // key length prefix of u64::MAX followed by a few bytes: a corrupt
+        // snapshot must be rejected with InvalidData, not panic the loader
+        let mut buf = vec![0xFFu8; 8];
+        buf.extend_from_slice(b"key");
+        std::fs::write(&path, buf).unwrap();
+
+        let err = load_snapshot(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn test_unimplemented_rpcs_return_status() {
         use crate::proto::galadh::lease_server::Lease;
