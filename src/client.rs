@@ -10,6 +10,9 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
 struct Cli {
+    /// gRPC endpoint of the galadh server
+    #[clap(long, default_value = "http://127.0.0.1:2379")]
+    addr: String,
     #[clap(subcommand)]
     command: Commands,
 }
@@ -61,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     env_logger::init();
 
-    let mut client = KvClient::connect("http://127.0.0.1:2379").await.unwrap();
+    let mut client = KvClient::connect(cli.addr.clone()).await?;
     match &cli.command {
         Commands::Get {
             key,

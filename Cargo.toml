@@ -19,6 +19,9 @@ tonic = "0.12"
 [build-dependencies]
 tonic-build = "0.12"
 
+[dev-dependencies]
+tokio-stream = { version = "0.1", features = ["sync"] }
+
 [[bin]]
 name = "gldh"
 path = "src/server.rs"

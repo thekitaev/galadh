@@ -103,6 +103,60 @@ impl TrieMap {
         out.sort_by(|a, b|a.0.cmp(&b.0));
         out
     }
+
+    /// Collect all pairs with `from <= key < to` (or `from <= key` when `to`
+    /// is None). Unlike `traverse`, subtrees that cannot contain a key
+    /// inside the range are pruned during descent.
+    pub fn scan(&self, from: &str, to: Option<&str>) -> Vec<KVPair> {
+        let mut out = vec![];
+        self.root.scan(from.as_bytes(), to, &mut Vec::new(), &mut out);
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+}
+
+impl TrieNode {
+    /// Depth-first scan with pruning. `path` accumulates the bytes leading
+    /// to `self`.
+    fn scan(
+        &self,
+        from: &[u8],
+        to: Option<&str>,
+        path: &mut Vec<u8>,
+        out: &mut Vec<KVPair>,
+    ) {
+        if let Some(key) = std::str::from_utf8(path).ok().filter(|_| {
+            !path.is_empty()
+                && path.as_slice() >= from
+                && to.is_none_or(|t| path.as_slice() < t.as_bytes())
+        }) {
+            if let Some(kv) = &self.kv {
+                out.push(KVPair(key.to_string(), kv.1.clone()));
+            }
+        }
+
+        let path_str = String::from_utf8_lossy(path).into_owned();
+        for (byte, child) in &self.children {
+            path.push(*byte);
+
+            // every key in this subtree has `path` as a prefix, hence is >= path;
+            // prune when even the smallest possible key is past the upper bound
+            let past_upper = to
+                .map(|t| path_str.as_str() >= t)
+                .unwrap_or(false);
+            // prune when no key in the subtree can reach `from`: path < from
+            // and the difference is not inside the path itself
+            let before_lower = path.as_slice() < from
+                && !from.starts_with(&path[..]);
+
+            if past_upper || before_lower {
+                path.pop();
+                continue;
+            }
+            child.scan(from, to, path, out);
+            path.pop();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -199,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prefix_filter() {
+    fn test_scan_prefix_range() {
         let mut trie = TrieMap::new();
         trie.put("ab", "v1");
         trie.put("abc", "v2");
@@ -207,20 +261,52 @@ mod tests {
         trie.put("ac", "v4");
         trie.put("zzz", "v5");
 
-        let prefix = "ab".to_string();
-        let matches = trie.traverse();
-        let filtered: Vec<_> = matches
-            .iter()
-            .filter(|item| {
-                !(item.0 < prefix
-                    || (!"".is_empty() && item.0 > "".to_string())
-                    || ("".is_empty() && !item.0.starts_with(&prefix)))
-            })
-            .collect();
-        assert_eq!(filtered.len(), 3);
-        assert_eq!(filtered[0].0, "ab");
-        assert_eq!(filtered[1].0, "abc");
-        assert_eq!(filtered[2].0, "abd");
+        // prefix "ab": canonical range end is the successor "ac"
+        let have = trie.scan("ab", Some("ac"));
+        let keys: Vec<_> = have.iter().map(|kv| kv.0.as_str()).collect();
+        assert_eq!(keys, vec!["ab", "abc", "abd"]);
+    }
+
+    #[test]
+    fn test_scan_exclusive_upper_bound() {
+        let mut trie = TrieMap::new();
+        trie.put("ab", "v1");
+        trie.put("abc", "v2");
+        trie.put("abd", "v3");
+        trie.put("ac", "v4");
+
+        let have = trie.scan("ab", Some("abd"));
+        let keys: Vec<_> = have.iter().map(|kv| kv.0.as_str()).collect();
+        assert_eq!(keys, vec!["ab", "abc"]);
+    }
+
+    #[test]
+    fn test_scan_open_ended() {
+        let mut trie = TrieMap::new();
+        trie.put("ab", "v1");
+        trie.put("abc", "v2");
+        trie.put("ac", "v3");
+        trie.put("zzz", "v4");
+
+        let have = trie.scan("ac", None);
+        let keys: Vec<_> = have.iter().map(|kv| kv.0.as_str()).collect();
+        assert_eq!(keys, vec!["ac", "zzz"]);
+    }
+
+    #[test]
+    fn test_scan_prunes_outside_range() {
+        let mut trie = TrieMap::new();
+        for k in ["aa", "ab", "abc", "ad", "b", "ba", "bb"] {
+            trie.put(k, "v");
+        }
+
+        let have = trie.scan("ab", Some("ad"));
+        let keys: Vec<_> = have.iter().map(|kv| kv.0.as_str()).collect();
+        assert_eq!(keys, vec!["ab", "abc"]);
+
+        let have = trie.scan("b", Some("bc"));
+        let keys: Vec<_> = have.iter().map(|kv| kv.0.as_str()).collect();
+        assert_eq!(keys, vec!["b", "ba", "bb"]);
     }
 
     #[test]
@@ -231,17 +317,8 @@ mod tests {
         trie.put("ac", "v3");
         trie.put("zzz", "v4");
 
-        let prefix = "ab".to_string();
-        let matches = trie.traverse();
-        let to_delete: Vec<_> = matches
-            .into_iter()
-            .filter(|item| {
-                !(item.0 < prefix
-                    || (!"".is_empty() && item.0 > "".to_string())
-                    || ("".is_empty() && !item.0.starts_with(&prefix)))
-            })
-            .collect();
-
+        let to_delete = trie.scan("ab", Some("ac"));
+        assert_eq!(to_delete.len(), 2);
         for kv in &to_delete {
             trie.delete(kv.0.as_str());
         }

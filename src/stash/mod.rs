@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -23,21 +24,52 @@ use crate::trie::TrieMap;
 
 mod utils;
 
+#[derive(Clone)]
 pub struct Stash {
     tree: Arc<Mutex<TrieMap>>,
     tx: broadcast::Sender<Event>,
-    #[allow(dead_code)]
-    rx: broadcast::Receiver<Event>,
+    snapshot: Option<PathBuf>,
 }
 
 impl Stash {
     #[allow(dead_code)]
     pub fn new() -> Self {
-        let (tx, rx) = broadcast::channel::<Event>(100);
+        let (tx, _rx) = broadcast::channel::<Event>(100);
         Self {
             tree: Arc::new(Mutex::new(TrieMap::new())),
             tx,
-            rx,
+            snapshot: None,
+        }
+    }
+
+    /// Create a Stash persisted to `path`: the snapshot is loaded on start
+    /// and rewritten atomically after every successful mutation.
+    #[allow(dead_code)]
+    pub fn with_snapshot(path: PathBuf) -> std::io::Result<Self> {
+        let mut tree = TrieMap::new();
+        if path.exists() {
+            let kvs = utils::load_snapshot(&path)?;
+            log::info!("loaded {} keys from snapshot {:?}", kvs.len(), path);
+            for kv in kvs {
+                tree.put(&kv.0, &kv.1);
+            }
+        } else if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let (tx, _rx) = broadcast::channel::<Event>(100);
+        Ok(Self {
+            tree: Arc::new(Mutex::new(tree)),
+            tx,
+            snapshot: Some(path),
+        })
+    }
+
+    fn persist(&self, tree: &TrieMap) {
+        if let Some(path) = &self.snapshot {
+            let kvs = tree.traverse();
+            if let Err(e) = utils::save_snapshot(path, &kvs) {
+                log::error!("failed to write snapshot {:?}: {}", path, e);
+            }
         }
     }
 
@@ -97,15 +129,9 @@ impl Kv for Stash {
         let matches: Vec<_> = if range_end.is_empty() {
             tree.get(key.as_str()).into_iter().collect()
         } else if range_end == "\0" {
-            tree.traverse()
-                .into_iter()
-                .filter(|item| item.0 >= key)
-                .collect()
+            tree.scan(&key, None)
         } else {
-            tree.traverse()
-                .into_iter()
-                .filter(|item| item.0 >= key && item.0 < range_end)
-                .collect()
+            tree.scan(&key, Some(&range_end))
         };
 
         let count = matches.len() as i64;
@@ -152,6 +178,7 @@ impl Kv for Stash {
         let mut tree = self.tree.lock().await;
 
         let old_val = tree.put(&key, val.as_str());
+        self.persist(&tree);
         let prev_kv = match (old_val, req.prev_kv) {
             (Some(v), true) => Some(create_kv(&v.0, &v.1)),
             (_, _) => None,
@@ -197,15 +224,9 @@ impl Kv for Stash {
         let matches: Vec<_> = if range_end.is_empty() {
             tree.get(key.as_str()).into_iter().collect()
         } else if range_end == "\0" {
-            tree.traverse()
-                .into_iter()
-                .filter(|item| item.0 >= key)
-                .collect()
+            tree.scan(&key, None)
         } else {
-            tree.traverse()
-                .into_iter()
-                .filter(|item| item.0 >= key && item.0 < range_end)
-                .collect()
+            tree.scan(&key, Some(&range_end))
         };
 
         let count = matches.len() as i64;
@@ -213,6 +234,7 @@ impl Kv for Stash {
             tree.delete(item.0.as_str());
             prev_kvs.push(create_kv(item.0.as_str(), item.1.as_str()));
         }
+        self.persist(&tree);
 
         for kv in &prev_kvs {
             self.send_delete(None, Some(kv.clone()))
@@ -290,7 +312,7 @@ mod tests {
     use crate::proto::galadh::{DeleteRangeRequest, PutRequest, RangeRequest};
 
     use super::Stash;
-    use super::utils::prefix_end;
+    use super::utils::{load_snapshot, prefix_end};
 
     async fn seed_stash(stash: &Stash) {
         let keys = vec!["ab", "abc", "abd", "ac", "zzz"];
@@ -596,5 +618,140 @@ mod tests {
             .into_inner();
 
         assert!(get_resp.kvs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("galadh-test-{}", std::process::id()));
+        let path = dir.join("galadh.snapshot");
+
+        let stash = Stash::with_snapshot(path.clone()).unwrap();
+        seed_stash(&stash).await;
+
+        // the snapshot file now contains all 5 seeded keys
+        let kvs = load_snapshot(&path).unwrap();
+        assert_eq!(kvs.len(), 5);
+
+        // a fresh Stash over the same file restores the data
+        let stash2 = Stash::with_snapshot(path.clone()).unwrap();
+        let resp = stash2
+            .range(Request::new(RangeRequest {
+                key: b"ab".to_vec(),
+                range_end: prefix_end(b"ab"),
+                limit: 0,
+                sort_order: 0,
+                sort_target: 0,
+                keys_only: false,
+                count_only: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.count, 3);
+
+        // deletions persist too
+        stash2
+            .delete_range(Request::new(DeleteRangeRequest {
+                key: b"ab".to_vec(),
+                range_end: prefix_end(b"ab"),
+                prev_kv: false,
+            }))
+            .await
+            .unwrap();
+        let stash3 = Stash::with_snapshot(path).unwrap();
+        let resp = stash3
+            .range(Request::new(RangeRequest {
+                key: b"a".to_vec(),
+                range_end: prefix_end(b"a"),
+                limit: 0,
+                sort_order: 0,
+                sort_target: 0,
+                keys_only: false,
+                count_only: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.count, 1); // only "ac" remains
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_unimplemented_rpcs_return_status() {
+        use crate::proto::galadh::lease_server::Lease;
+        use crate::proto::galadh::{
+            LeaseGrantRequest, LeaseRevokeRequest, LeaseTimeToLiveRequest, LeaseLeasesRequest,
+            TxnRequest,
+        };
+
+        let stash = Stash::new();
+
+        let resp = stash.txn(Request::new(TxnRequest::default())).await;
+        assert_eq!(resp.unwrap_err().code(), tonic::Code::Unimplemented);
+
+        let resp = stash
+            .lease_grant(Request::new(LeaseGrantRequest::default()))
+            .await;
+        assert_eq!(resp.unwrap_err().code(), tonic::Code::Unimplemented);
+
+        let resp = stash
+            .lease_revoke(Request::new(LeaseRevokeRequest::default()))
+            .await;
+        assert_eq!(resp.unwrap_err().code(), tonic::Code::Unimplemented);
+
+        let resp = stash
+            .lease_time_to_live(Request::new(LeaseTimeToLiveRequest::default()))
+            .await;
+        assert_eq!(resp.unwrap_err().code(), tonic::Code::Unimplemented);
+
+        let resp = stash
+            .lease_leases(Request::new(LeaseLeasesRequest::default()))
+            .await;
+        assert_eq!(resp.unwrap_err().code(), tonic::Code::Unimplemented);
+    }
+
+    /// Streaming rpcs cannot be called directly (tonic's `Streaming` type is
+    /// not constructible outside the transport), so run a real in-process
+    /// server and hit watch/lease_keep_alive over the wire.
+    #[tokio::test]
+    async fn test_streaming_rpcs_unimplemented_over_grpc() {
+        use crate::proto::galadh::lease_server::LeaseServer;
+        use crate::proto::galadh::lease_client::LeaseClient;
+        use crate::proto::galadh::watch_server::WatchServer;
+        use crate::proto::galadh::watch_client::WatchClient;
+        use crate::proto::galadh::{LeaseKeepAliveRequest, WatchRequest};
+
+        let stash = Stash::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(LeaseServer::new(stash.clone()))
+                .add_service(WatchServer::new(stash))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        let mut lease = LeaseClient::connect(format!("http://{addr}")).await.unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            tx.send(LeaseKeepAliveRequest::default()).await.unwrap();
+        });
+        let resp = lease
+            .lease_keep_alive(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await;
+        assert_eq!(resp.unwrap_err().code(), tonic::Code::Unimplemented);
+
+        let mut watch = WatchClient::connect(format!("http://{addr}")).await.unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            tx.send(WatchRequest::default()).await.unwrap();
+        });
+        let resp = watch
+            .watch(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await;
+        assert_eq!(resp.unwrap_err().code(), tonic::Code::Unimplemented);
     }
 }

@@ -12,7 +12,7 @@ It comes with two binaries: `gldh` is a server and `gldh-cli` is a client
 
 ### How-to
 ```bash
-# run server
+# run server (add --data-dir DIR to persist across restarts, --addr HOST:PORT to pick an address)
 $ gldh
 # use client in another terminal
 $ gldh-cli put key value
@@ -24,22 +24,22 @@ value
 ### TODO (server)
 - [x] get/put 
 - [x] delete
-- [ ] snapshots and restoring from snapshot
-- [ ] running params
-- [ ] replace prefix tree dep or implement an own one
+- [x] snapshots and restoring from snapshot (`--data-dir`)
+- [x] running params (`--addr`, `--data-dir`)
+- [x] replace prefix tree dep or implement an own one
 - [ ] watchers
 - [ ] leases
 - [ ] transactions
-- [ ] tests
+- [x] tests
 - [ ] docs
 - [ ] cluster
 - [ ] ???
 
 ### TODO (client)
-- [x] get (partially)
-- [ ] put
-- [ ] connection params
-- [ ] delete
+- [x] get
+- [x] put
+- [x] connection params (`--addr`)
+- [x] delete
 - [ ] watch
 - [ ] transactions
 - [ ] ???
