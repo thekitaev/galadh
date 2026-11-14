@@ -24,3 +24,17 @@ pub(crate) fn create_kv(key: &str, val: &str) -> KeyValue {
         lease: 0,
     }
 }
+
+/// etcd-style range end for a prefix scan: increment the last byte,
+/// carrying over 0xff bytes. A key of all 0xff has no successor,
+/// so "\\0" (all keys >= key) is used instead.
+pub(crate) fn prefix_end(key: &[u8]) -> Vec<u8> {
+    let mut end = key.to_vec();
+    for i in (0..end.len()).rev() {
+        if end[i] < 0xff {
+            end[i] += 1;
+            return end;
+        }
+    }
+    vec![0]
+}

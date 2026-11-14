@@ -38,6 +38,20 @@ enum Commands {
     },
 }
 
+/// etcd-style range end for a prefix scan: increment the last byte,
+/// carrying over 0xff bytes. A key of all 0xff has no successor,
+/// so "\0" (all keys >= key) is used instead.
+fn prefix_end(key: &str) -> Vec<u8> {
+    let mut end = key.as_bytes().to_vec();
+    for i in (0..end.len()).rev() {
+        if end[i] < 0xff {
+            end[i] += 1;
+            return end;
+        }
+    }
+    vec![0]
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -60,9 +74,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let req = tonic::Request::new(RangeRequest {
                 key: key.clone().into_bytes(),
                 range_end: if *prefix {
-                    "".as_bytes().into()
+                    prefix_end(key)
                 } else {
-                    key.clone().into_bytes()
+                    // empty range_end: exact key lookup (etcd semantics)
+                    vec![]
                 },
                 limit: *limit as i64,
                 sort_order: 0,
@@ -85,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(err) => {
-                    log::error!("Err getting key {}: {}", &key, err)
+                    log::error!("Err getting key {}: {}", key, err)
                 }
             }
         }
@@ -95,20 +110,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 value: val.clone().into_bytes(),
                 lease: 0,
                 prev_kv: true,
-                ignore_value: true,
-                ignore_lease: true,
+                ignore_value: false,
+                ignore_lease: false,
             });
             let response = client.put(req).await;
             match response {
                 Ok(res) => {
                     let res = res.into_inner();
-                    if let Some(kv) = res.prev_kv {
-                        let new_value = String::from_utf8_lossy(&kv.value);
-                        println!("OK value changed:\n{}\n{}", new_value, val.clone());
+                    match res.prev_kv {
+                        Some(kv) => println!(
+                            "OK, replaced previous value:\n{}",
+                            String::from_utf8_lossy(&kv.value)
+                        ),
+                        None => println!("OK, key created:\n{}\n{}", key, val),
                     }
                 }
                 Err(err) => {
-                    log::error!("Err putting key {}: {}", &key, err)
+                    log::error!("Err putting key {}: {}", key, err)
                 }
             }
         }
@@ -116,9 +134,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let req = tonic::Request::new(DeleteRangeRequest {
                 key: key.clone().into_bytes(),
                 range_end: if *prefix {
-                    "".as_bytes().into()
+                    prefix_end(key)
                 } else {
-                    key.clone().into_bytes()
+                    // empty range_end: delete the single key (etcd semantics)
+                    vec![]
                 },
                 prev_kv: true,
             });
@@ -135,7 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(err) => {
-                    log::error!("Err deleting key {}: {}", &key, err)
+                    log::error!("Err deleting key {}: {}", key, err)
                 }
             }
         }

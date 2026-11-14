@@ -74,55 +74,65 @@ impl Kv for Stash {
         let (key, range_end) = match read_key_val(req.key, req.range_end) {
             Err(e) => {
                 log::error!("error reading key-range_end: {}", e);
-                return Err(Status::unknown(e.to_string()));
+                return Err(Status::invalid_argument(e.to_string()));
             }
             Ok((k, v)) => (k, v),
         };
 
+        if req.keys_only && req.count_only {
+            return Err(Status::invalid_argument(
+                "keys_only and count_only cannot be set together",
+            ));
+        }
+
         log::info!("GET: key '{}', range_end '{}'", key, range_end);
 
         let tree = self.tree.lock().await;
-        let mut count = 0;
-        let mut total = 0;
         let mut kvs = vec![];
 
-        if key == range_end {
-            let res = tree.get(key.as_str());
-            if let Some(res) = res {
-                kvs.push(create_kv(res.0.as_str(), res.1.as_str()));
-                total = 1
-            }
+        // etcd semantics:
+        // - range_end empty: look up the single key
+        // - range_end == "\0": all keys >= key
+        // - otherwise: [key, range_end), upper bound exclusive
+        let matches: Vec<_> = if range_end.is_empty() {
+            tree.get(key.as_str()).into_iter().collect()
+        } else if range_end == "\0" {
+            tree.traverse()
+                .into_iter()
+                .filter(|item| item.0 >= key)
+                .collect()
         } else {
-            let matches = tree.traverse();
-            log::info!("found {}", matches.len());
-            for item in &matches {
-                if item.0 < key
-                    || (!range_end.is_empty() && item.0 > range_end)
-                    || (range_end.is_empty() && !item.0.starts_with(&key))
-                {
-                    log::info!("skipping");
-                    continue
-                }
-                let kv: Option<KeyValue> = match (req.keys_only, req.count_only) {
-                    (true, true) => return Err(Status::unknown("bad request")),
-                    (true, false) => Some(create_kv(item.0.as_str(), "")),
-                    (false, true) => None,
-                    (false, false) => Some(create_kv(item.0.as_str(), item.1.as_str())),
-                };
-                if let Some(kv) = kv {
-                    kvs.push(kv)
-                };
-                count += 1;
+            tree.traverse()
+                .into_iter()
+                .filter(|item| item.0 >= key && item.0 < range_end)
+                .collect()
+        };
+
+        let count = matches.len() as i64;
+        let limit = if req.limit > 0 {
+            Some(req.limit as usize)
+        } else {
+            None
+        };
+        let more = match limit {
+            Some(l) => count > l as i64,
+            None => false,
+        };
+
+        for item in matches.into_iter().take(limit.unwrap_or(usize::MAX)) {
+            if req.count_only {
+                continue;
             }
-            total = matches.len() as i64;
+            let value = if req.keys_only { "" } else { item.1.as_str() };
+            kvs.push(create_kv(item.0.as_str(), value));
         }
 
-        log::info!("returned {} items", kvs.len());
+        log::info!("returned {} items, count {}", kvs.len(), count);
 
         Ok(Response::new(RangeResponse {
             kvs,
-            more: total > count,
-            count: total,
+            more,
+            count,
         }))
     }
 
@@ -166,7 +176,7 @@ impl Kv for Stash {
         let (key, range_end) = match read_key_val(req.key, req.range_end) {
             Err(e) => {
                 log::error!("error reading key-range_end: {}", e);
-                return Err(Status::unknown(e.to_string()));
+                return Err(Status::invalid_argument(e.to_string()));
             }
             Ok((k, v)) => (k, v),
         };
@@ -181,29 +191,27 @@ impl Kv for Stash {
         let mut tree = self.tree.lock().await;
 
         let mut prev_kvs = vec![];
-        let mut count: i64 = 0;
 
-        if key == range_end {
-            let old = tree.get(key.as_str());
-            if let Some(kv) = old {
-                tree.delete(key.as_str());
-                count = 1;
-                prev_kvs.push(create_kv(kv.0.as_str(), kv.1.as_str()));
-            }
+        // same range semantics as range(): empty range_end deletes the single
+        // key, "\0" deletes all keys >= key, otherwise [key, range_end)
+        let matches: Vec<_> = if range_end.is_empty() {
+            tree.get(key.as_str()).into_iter().collect()
+        } else if range_end == "\0" {
+            tree.traverse()
+                .into_iter()
+                .filter(|item| item.0 >= key)
+                .collect()
         } else {
-            let matches = tree.traverse();
-            log::info!("found {} candidates to delete", matches.len());
-            for item in matches {
-                if item.0 < key
-                    || (!range_end.is_empty() && item.0 > range_end)
-                    || (range_end.is_empty() && !item.0.starts_with(&key))
-                {
-                    continue;
-                }
-                tree.delete(item.0.as_str());
-                count += 1;
-                prev_kvs.push(create_kv(item.0.as_str(), item.1.as_str()));
-            }
+            tree.traverse()
+                .into_iter()
+                .filter(|item| item.0 >= key && item.0 < range_end)
+                .collect()
+        };
+
+        let count = matches.len() as i64;
+        for item in matches {
+            tree.delete(item.0.as_str());
+            prev_kvs.push(create_kv(item.0.as_str(), item.1.as_str()));
         }
 
         for kv in &prev_kvs {
@@ -217,7 +225,7 @@ impl Kv for Stash {
     }
 
     async fn txn(&self, _request: Request<TxnRequest>) -> Result<Response<TxnResponse>, Status> {
-        todo!()
+        Err(Status::unimplemented("transactions are not implemented"))
     }
 }
 
@@ -227,14 +235,14 @@ impl Lease for Stash {
         &self,
         _request: Request<LeaseGrantRequest>,
     ) -> Result<Response<LeaseGrantResponse>, Status> {
-        todo!()
+        Err(Status::unimplemented("leases are not implemented"))
     }
 
     async fn lease_revoke(
         &self,
         _request: Request<LeaseRevokeRequest>,
     ) -> Result<Response<LeaseRevokeResponse>, Status> {
-        todo!()
+        Err(Status::unimplemented("leases are not implemented"))
     }
 
     type LeaseKeepAliveStream =
@@ -244,21 +252,21 @@ impl Lease for Stash {
         &self,
         _request: Request<Streaming<LeaseKeepAliveRequest>>,
     ) -> Result<Response<Self::LeaseKeepAliveStream>, Status> {
-        todo!()
+        Err(Status::unimplemented("leases are not implemented"))
     }
 
     async fn lease_time_to_live(
         &self,
         _request: Request<LeaseTimeToLiveRequest>,
     ) -> Result<Response<LeaseTimeToLiveResponse>, Status> {
-        todo!()
+        Err(Status::unimplemented("leases are not implemented"))
     }
 
     async fn lease_leases(
         &self,
         _request: Request<LeaseLeasesRequest>,
     ) -> Result<Response<LeaseLeasesResponse>, Status> {
-        todo!()
+        Err(Status::unimplemented("leases are not implemented"))
     }
 }
 
@@ -270,7 +278,7 @@ impl Watch for Stash {
         &self,
         _request: Request<Streaming<WatchRequest>>,
     ) -> Result<Response<Self::WatchStream>, Status> {
-        todo!()
+        Err(Status::unimplemented("watch is not implemented"))
     }
 }
 
@@ -282,6 +290,7 @@ mod tests {
     use crate::proto::galadh::{DeleteRangeRequest, PutRequest, RangeRequest};
 
     use super::Stash;
+    use super::utils::prefix_end;
 
     async fn seed_stash(stash: &Stash) {
         let keys = vec!["ab", "abc", "abd", "ac", "zzz"];
@@ -308,7 +317,7 @@ mod tests {
         let resp = stash
             .range(Request::new(RangeRequest {
                 key: b"ab".to_vec(),
-                range_end: vec![],
+                range_end: prefix_end(b"ab"),
                 limit: 100,
                 sort_order: 0,
                 sort_target: 0,
@@ -325,6 +334,80 @@ mod tests {
             .map(|kv| String::from_utf8(kv.key.clone()).unwrap())
             .collect();
         assert_eq!(returned, vec!["ab", "abc", "abd"]);
+        assert_eq!(resp.count, 3);
+        assert!(!resp.more);
+    }
+
+    #[tokio::test]
+    async fn test_range_prefix_limit_returns_more_flag() {
+        let stash = Stash::new();
+        seed_stash(&stash).await;
+
+        let resp = stash
+            .range(Request::new(RangeRequest {
+                key: b"ab".to_vec(),
+                range_end: prefix_end(b"ab"),
+                limit: 2,
+                sort_order: 0,
+                sort_target: 0,
+                keys_only: false,
+                count_only: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let returned: Vec<String> = resp
+            .kvs
+            .iter()
+            .map(|kv| String::from_utf8(kv.key.clone()).unwrap())
+            .collect();
+        assert_eq!(returned, vec!["ab", "abc"]);
+        assert_eq!(resp.count, 3);
+        assert!(resp.more);
+    }
+
+    #[tokio::test]
+    async fn test_range_count_only_returns_count_without_kvs() {
+        let stash = Stash::new();
+        seed_stash(&stash).await;
+
+        let resp = stash
+            .range(Request::new(RangeRequest {
+                key: b"ab".to_vec(),
+                range_end: prefix_end(b"ab"),
+                limit: 0,
+                sort_order: 0,
+                sort_target: 0,
+                keys_only: false,
+                count_only: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(resp.kvs.is_empty());
+        assert_eq!(resp.count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_range_keys_only_and_count_only_is_invalid_argument() {
+        let stash = Stash::new();
+        seed_stash(&stash).await;
+
+        let resp = stash
+            .range(Request::new(RangeRequest {
+                key: b"ab".to_vec(),
+                range_end: prefix_end(b"ab"),
+                limit: 0,
+                sort_order: 0,
+                sort_target: 0,
+                keys_only: true,
+                count_only: true,
+            }))
+            .await;
+
+        assert_eq!(resp.unwrap_err().code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]
@@ -335,7 +418,7 @@ mod tests {
         let resp = stash
             .range(Request::new(RangeRequest {
                 key: b"ac".to_vec(),
-                range_end: b"ac".to_vec(),
+                range_end: vec![],
                 limit: 100,
                 sort_order: 0,
                 sort_target: 0,
@@ -346,11 +429,88 @@ mod tests {
             .unwrap()
             .into_inner();
 
-        assert_eq!(resp.kvs.len(), 1);
+        assert_eq!(resp.count, 1);
         assert_eq!(
             String::from_utf8(resp.kvs[0].key.clone()).unwrap(),
             "ac"
         );
+    }
+
+    #[tokio::test]
+    async fn test_range_exact_missing_key_returns_empty() {
+        let stash = Stash::new();
+        seed_stash(&stash).await;
+
+        let resp = stash
+            .range(Request::new(RangeRequest {
+                key: b"nope".to_vec(),
+                range_end: vec![],
+                limit: 100,
+                sort_order: 0,
+                sort_target: 0,
+                keys_only: false,
+                count_only: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(resp.kvs.is_empty());
+        assert_eq!(resp.count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_range_upper_bound_is_exclusive() {
+        let stash = Stash::new();
+        seed_stash(&stash).await;
+
+        let resp = stash
+            .range(Request::new(RangeRequest {
+                key: b"ab".to_vec(),
+                range_end: b"abd".to_vec(),
+                limit: 0,
+                sort_order: 0,
+                sort_target: 0,
+                keys_only: false,
+                count_only: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let returned: Vec<String> = resp
+            .kvs
+            .iter()
+            .map(|kv| String::from_utf8(kv.key.clone()).unwrap())
+            .collect();
+        assert_eq!(returned, vec!["ab", "abc"]);
+    }
+
+    #[tokio::test]
+    async fn test_range_zero_range_end_returns_all_keys_from_key() {
+        let stash = Stash::new();
+        seed_stash(&stash).await;
+
+        let resp = stash
+            .range(Request::new(RangeRequest {
+                key: b"ac".to_vec(),
+                range_end: vec![0],
+                limit: 0,
+                sort_order: 0,
+                sort_target: 0,
+                keys_only: false,
+                count_only: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let returned: Vec<String> = resp
+            .kvs
+            .iter()
+            .map(|kv| String::from_utf8(kv.key.clone()).unwrap())
+            .collect();
+        assert_eq!(returned, vec!["ac", "zzz"]);
     }
 
     #[tokio::test]
@@ -361,7 +521,7 @@ mod tests {
         let del_resp = stash
             .delete_range(Request::new(DeleteRangeRequest {
                 key: b"ab".to_vec(),
-                range_end: vec![],
+                range_end: prefix_end(b"ab"),
                 prev_kv: true,
             }))
             .await
@@ -380,7 +540,7 @@ mod tests {
         let get_resp = stash
             .range(Request::new(RangeRequest {
                 key: b"a".to_vec(),
-                range_end: vec![],
+                range_end: prefix_end(b"a"),
                 limit: 100,
                 sort_order: 0,
                 sort_target: 0,
@@ -407,7 +567,7 @@ mod tests {
         let del_resp = stash
             .delete_range(Request::new(DeleteRangeRequest {
                 key: b"zzz".to_vec(),
-                range_end: b"zzz".to_vec(),
+                range_end: vec![],
                 prev_kv: true,
             }))
             .await
@@ -424,7 +584,7 @@ mod tests {
         let get_resp = stash
             .range(Request::new(RangeRequest {
                 key: b"zzz".to_vec(),
-                range_end: b"zzz".to_vec(),
+                range_end: vec![],
                 limit: 100,
                 sort_order: 0,
                 sort_target: 0,
