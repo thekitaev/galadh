@@ -1,6 +1,6 @@
 use std::collections::{hash_map::Entry, HashMap};
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct TrieNode {
     children: HashMap<u8, TrieNode>,
     kv: Option<KVPair>,
@@ -72,6 +72,7 @@ impl TrieNode {
     }
 }
 
+#[derive(Clone)]
 pub struct TrieMap {
     root: TrieNode,
 }

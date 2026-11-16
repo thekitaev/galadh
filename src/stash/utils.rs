@@ -2,13 +2,7 @@ use crate::proto::galadh::KeyValue;
 use crate::trie::KVPair;
 use std::io;
 use std::path::Path;
-use std::string::FromUtf8Error;
 
-pub(crate) fn read_key_val(key: Vec<u8>, val: Vec<u8>) -> Result<(String, String), FromUtf8Error> {
-    let key = String::from_utf8(key)?;
-    let val = String::from_utf8(val)?;
-    Ok((key, val))
-}
 pub(crate) fn create_kv(key: &str, val: &str) -> KeyValue {
     KeyValue {
         key: key.into(),

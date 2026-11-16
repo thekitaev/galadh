@@ -1,7 +1,10 @@
 mod proto;
 
 use crate::proto::galadh::kv_client::KvClient;
-use crate::proto::galadh::{DeleteRangeRequest, PutRequest, RangeRequest};
+use crate::proto::galadh::{
+    compare, request_op, Compare, DeleteRangeRequest, PutRequest, RangeRequest, RequestOp,
+    TxnRequest,
+};
 
 use std::env;
 
@@ -39,6 +42,14 @@ enum Commands {
         #[clap(long)]
         prefix: bool,
     },
+    /// put the value only if the key does not exist (txn under the hood)
+    PutIfAbsent { key: String, val: String },
+    /// compare-and-set: replace the value only if it currently equals EXPECTED
+    Cas {
+        key: String,
+        expected: String,
+        new: String,
+    },
 }
 
 /// etcd-style range end for a prefix scan: increment the last byte,
@@ -53,6 +64,48 @@ fn prefix_end(key: &str) -> Vec<u8> {
         }
     }
     vec![0]
+}
+
+/// TxnRequest: put the value only while the key is absent (version == 0).
+fn txn_create_if_absent(key: &str, val: &str) -> TxnRequest {
+    TxnRequest {
+        compare: vec![Compare {
+            result: compare::CompareResult::Equal as i32,
+            target: compare::CompareTarget::Version as i32,
+            key: key.as_bytes().to_vec(),
+            target_union: Some(compare::TargetUnion::Version(0)),
+            ..Default::default()
+        }],
+        success: vec![RequestOp {
+            request: Some(request_op::Request::RequestPut(PutRequest {
+                key: key.as_bytes().to_vec(),
+                value: val.as_bytes().to_vec(),
+                ..Default::default()
+            })),
+        }],
+        failure: vec![],
+    }
+}
+
+/// TxnRequest: replace the value only if it currently equals `expected`.
+fn txn_cas(key: &str, expected: &str, new: &str) -> TxnRequest {
+    TxnRequest {
+        compare: vec![Compare {
+            result: compare::CompareResult::Equal as i32,
+            target: compare::CompareTarget::Value as i32,
+            key: key.as_bytes().to_vec(),
+            target_union: Some(compare::TargetUnion::Value(expected.as_bytes().to_vec())),
+            ..Default::default()
+        }],
+        success: vec![RequestOp {
+            request: Some(request_op::Request::RequestPut(PutRequest {
+                key: key.as_bytes().to_vec(),
+                value: new.as_bytes().to_vec(),
+                ..Default::default()
+            })),
+        }],
+        failure: vec![],
+    }
 }
 
 #[tokio::main]
@@ -130,6 +183,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(err) => {
                     log::error!("Err putting key {}: {}", key, err)
+                }
+            }
+        }
+        Commands::PutIfAbsent { key, val } => {
+            let req = txn_create_if_absent(key, val);
+            match client.txn(tonic::Request::new(req)).await {
+                Ok(res) => {
+                    if res.into_inner().succeeded {
+                        println!("OK, key created:\n{}\n{}", key, val);
+                    } else {
+                        eprintln!("FAILED: key already exists");
+                        std::process::exit(1);
+                    }
+                }
+                Err(err) => {
+                    log::error!("Err put-if-absent {}: {}", key, err);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Cas {
+            key,
+            expected,
+            new,
+        } => {
+            let req = txn_cas(key, expected, new);
+            match client.txn(tonic::Request::new(req)).await {
+                Ok(res) => {
+                    if res.into_inner().succeeded {
+                        println!("OK, value replaced:\n{} -> {}", expected, new);
+                    } else {
+                        eprintln!("FAILED: current value does not match {}", expected);
+                        std::process::exit(1);
+                    }
+                }
+                Err(err) => {
+                    log::error!("Err cas {}: {}", key, err);
+                    std::process::exit(1);
                 }
             }
         }

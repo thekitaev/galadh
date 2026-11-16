@@ -29,7 +29,7 @@ value
 - [x] replace prefix tree dep or implement an own one
 - [x] watchers (create/cancel, prefix/exact/range, filters, prev_kv)
 - [x] leases (grant/revoke/keepalive/time-to-live/expiry; lease attachments are not persisted)
-- [ ] transactions
+- [x] transactions (compare + success/failure branches, nested txns; VERSION/CREATE/MOD compares are synthesized {0,1} — "key exists" idioms are exact, `version == N` for N >= 2 is never true; empty keys are rejected)
 - [x] tests
 - [ ] docs
 - [ ] cluster
@@ -40,6 +40,7 @@ value
 - [x] put
 - [x] connection params (`--addr`)
 - [x] delete
+- [x] put-if-absent / cas (via Txn)
 - [ ] watch
-- [ ] transactions
+- [ ] transactions (raw)
 - [ ] ???
