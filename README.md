@@ -27,8 +27,8 @@ value
 - [x] snapshots and restoring from snapshot (`--data-dir`)
 - [x] running params (`--addr`, `--data-dir`)
 - [x] replace prefix tree dep or implement an own one
-- [ ] watchers
-- [ ] leases
+- [x] watchers (create/cancel, prefix/exact/range, filters, prev_kv)
+- [x] leases (grant/revoke/keepalive/time-to-live/expiry; lease attachments are not persisted)
 - [ ] transactions
 - [x] tests
 - [ ] docs
