@@ -3,6 +3,7 @@ mod stash;
 mod trie;
 
 use crate::proto::galadh::kv_server::KvServer;
+use crate::proto::galadh::{lease_server, watch_server};
 use crate::stash::Stash;
 use clap::Parser;
 use std::path::PathBuf;
@@ -44,7 +45,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = args.addr.parse()?;
 
     Server::builder()
-        .add_service(KvServer::new(stash))
+        .add_service(KvServer::new(stash.clone()))
+        .add_service(lease_server::LeaseServer::new(stash.clone()))
+        .add_service(watch_server::WatchServer::new(stash))
         .serve(addr)
         .await?;
 
