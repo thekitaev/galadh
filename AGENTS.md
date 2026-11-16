@@ -43,7 +43,8 @@ Smoke test by hand:
    - prefix scan = `range_end = key+1` (successor with 0xff carry, see `prefix_end` in `src/stash/utils.rs` and `src/client.rs`)
    - `limit` must be applied; `count` = number of keys in range (not capped by limit); `more` = `count > returned`
 2. **Never `todo!()` in rpc handlers** — a panic kills the connection. Endpoints that are
-   not implemented return `Status::unimplemented(...)` (currently: `Txn`, all `Lease` rpcs, `Watch`).
+   not implemented return `Status::unimplemented(...)` (currently only `Txn`; Watch and
+   Lease are implemented, see below).
 3. **Bad client input → `Status::invalid_argument`**, not `unknown`.
 4. `keys_only` and `count_only` together are rejected.
 
@@ -51,6 +52,11 @@ Smoke test by hand:
 
 - Persistence is snapshot-per-write (`--data-dir`): the whole trie is rewritten on every
   mutation — fine for alpha, not for large datasets or high write rates.
+- Lease attachments are in-memory only: the snapshot does not store key→lease mappings,
+  so after a restart keys survive but their leases (and expiry) are gone.
+  `KeyValue.lease` in responses is always 0 — the trie does not carry the lease id.
+- Watch events come from a bounded broadcast channel (256): a client slower than that
+  misses events (logged as lag), etcd would compact-and-resync instead.
 - Keys/values are `String`s: non-UTF-8 (binary) keys are rejected, unlike etcd.
 - Range scans use `TrieMap::scan` with subtree pruning, but still build the full result
   vector before applying `limit`.
