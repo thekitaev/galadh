@@ -43,8 +43,8 @@ Smoke test by hand:
    - prefix scan = `range_end = key+1` (successor with 0xff carry, see `prefix_end` in `src/stash/utils.rs` and `src/client.rs`)
    - `limit` must be applied; `count` = number of keys in range (not capped by limit); `more` = `count > returned`
 2. **Never `todo!()` in rpc handlers** — a panic kills the connection. Endpoints that are
-   not implemented return `Status::unimplemented(...)` (currently only `Txn`; Watch and
-   Lease are implemented, see below).
+   not implemented return `Status::unimplemented(...)`. All KV/Watch/Lease rpcs are now
+   implemented, including `Txn` (see `src/stash/txn.rs`).
 3. **Bad client input → `Status::invalid_argument`**, not `unknown`.
 4. `keys_only` and `count_only` together are rejected.
 
@@ -52,6 +52,11 @@ Smoke test by hand:
 
 - Persistence is snapshot-per-write (`--data-dir`): the whole trie is rewritten on every
   mutation — fine for alpha, not for large datasets or high write rates.
+- Txn is atomic via clone-and-swap (`src/stash/txn.rs`): O(all keys) per txn, agreed with
+  the O(N) snapshot profile. VERSION/CREATE/MOD compares are synthesized {0,1}; a txn may
+  not put the same key twice or put a key its own delete_range covers; nested txns are
+  capped at 32 levels / 1024 total ops. A txn with `lease != 0` on an unknown lease fails
+  with `failed_precondition`, aborting the whole txn.
 - Lease attachments are in-memory only: the snapshot does not store key→lease mappings,
   so after a restart keys survive but their leases (and expiry) are gone.
   `KeyValue.lease` in responses is always 0 — the trie does not carry the lease id.

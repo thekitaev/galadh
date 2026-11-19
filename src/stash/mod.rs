@@ -10,10 +10,10 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use tonic::{Request, Response, Status, Streaming};
 use tokio_stream::wrappers::ReceiverStream;
 
-use utils::{create_kv, read_key_val};
+use utils::create_kv;
 
 use crate::proto::galadh::{
-    DeleteRangeRequest, DeleteRangeResponse, KeyValue, LeaseGrantRequest, LeaseGrantResponse,
+    DeleteRangeRequest, DeleteRangeResponse, LeaseGrantRequest, LeaseGrantResponse,
     LeaseKeepAliveRequest, LeaseKeepAliveResponse, LeaseLeasesRequest, LeaseLeasesResponse,
     LeaseRevokeRequest, LeaseRevokeResponse, LeaseStatus, LeaseTimeToLiveRequest,
     LeaseTimeToLiveResponse, PutRequest, PutResponse, RangeRequest, RangeResponse, TxnRequest,
@@ -26,16 +26,17 @@ use crate::proto::galadh::watch_request;
 use crate::proto::galadh::watch_server::Watch;
 use crate::trie::TrieMap;
 
+mod txn;
 mod utils;
 
 /// A registered lease: TTL in seconds, the moment it lapses and the keys
 /// attached to it. Key -> lease association lives only here (the trie value
 /// does not carry the lease id), so KeyValue.lease in responses is always 0.
 #[derive(Debug)]
-struct LeaseInfo {
-    ttl: i64,
-    expires_at: Instant,
-    keys: HashSet<String>,
+pub(crate) struct LeaseInfo {
+    pub(crate) ttl: i64,
+    pub(crate) expires_at: Instant,
+    pub(crate) keys: HashSet<String>,
 }
 
 static LEASE_SEQ: AtomicI64 = AtomicI64::new(1);
@@ -133,7 +134,11 @@ impl Stash {
             if tree.get(&key).is_some() {
                 tree.delete(&key);
                 deleted += 1;
-                self.send_delete(Some(create_kv(&key, "")), None);
+                self.send_event(Event {
+                    r#type: 1, // DELETE
+                    kv: Some(create_kv(&key, "")),
+                    prev_kv: None,
+                });
             }
         }
         self.persist(&tree);
@@ -150,21 +155,34 @@ impl Stash {
         }
     }
 
-    fn send_put(&self, new_kv: Option<KeyValue>, old_kv: Option<KeyValue>) {
-        self.send_event(0, new_kv, old_kv)
+    /// Apply deferred side effects of a successful operation/transaction to
+    /// the real state. Infallible: lease attach/detach cannot fail, persist
+    /// failures are logged, broadcast send failures are logged.
+    fn apply_commit_log(
+        &self,
+        tree: &mut TrieMap,
+        leases: &mut HashMap<i64, LeaseInfo>,
+        log: txn::CommitLog,
+    ) {
+        for (id, key) in &log.lease_attach {
+            if let Some(info) = leases.get_mut(id) {
+                info.keys.insert(key.clone());
+            }
+        }
+        for key in &log.detached_keys {
+            for info in leases.values_mut() {
+                info.keys.remove(key);
+            }
+        }
+        if log.mutated {
+            self.persist(tree);
+        }
+        for event in log.events {
+            self.send_event(event);
+        }
     }
 
-    fn send_delete(&self, new_kv: Option<KeyValue>, old_kv: Option<KeyValue>) {
-        self.send_event(1, new_kv, old_kv)
-    }
-
-    fn send_event(&self, event_type: i32, new_kv: Option<KeyValue>, old_kv: Option<KeyValue>) {
-        let event = Event {
-            r#type: event_type,
-            kv: new_kv,
-            prev_kv: old_kv,
-        };
-
+    fn send_event(&self, event: Event) {
         let send_result = self.tx.send(event.clone());
         if let Err(e) = send_result {
             log::error!("err publishing event '{:?}': {}", event, e)
@@ -179,111 +197,30 @@ impl Kv for Stash {
         request: Request<RangeRequest>,
     ) -> Result<Response<RangeResponse>, Status> {
         let req = request.into_inner();
-
-        let (key, range_end) = match read_key_val(req.key, req.range_end) {
-            Err(e) => {
-                log::error!("error reading key-range_end: {}", e);
-                return Err(Status::invalid_argument(e.to_string()));
-            }
-            Ok((k, v)) => (k, v),
-        };
-
-        if req.keys_only && req.count_only {
-            return Err(Status::invalid_argument(
-                "keys_only and count_only cannot be set together",
-            ));
-        }
-
-        log::info!("GET: key '{}', range_end '{}'", key, range_end);
-
         let tree = self.tree.lock().await;
-        let mut kvs = vec![];
-
-        // etcd semantics:
-        // - range_end empty: look up the single key
-        // - range_end == "\0": all keys >= key
-        // - otherwise: [key, range_end), upper bound exclusive
-        let matches: Vec<_> = if range_end.is_empty() {
-            tree.get(key.as_str()).into_iter().collect()
-        } else if range_end == "\0" {
-            tree.scan(&key, None)
-        } else {
-            tree.scan(&key, Some(&range_end))
-        };
-
-        let count = matches.len() as i64;
-        let limit = if req.limit > 0 {
-            Some(req.limit as usize)
-        } else {
-            None
-        };
-        let more = match limit {
-            Some(l) => count > l as i64,
-            None => false,
-        };
-
-        for item in matches.into_iter().take(limit.unwrap_or(usize::MAX)) {
-            if req.count_only {
-                continue;
-            }
-            let value = if req.keys_only { "" } else { item.1.as_str() };
-            kvs.push(create_kv(item.0.as_str(), value));
-        }
-
-        log::info!("returned {} items, count {}", kvs.len(), count);
-
-        Ok(Response::new(RangeResponse {
-            kvs,
-            more,
-            count,
-        }))
+        let resp = txn::range_core(&tree, &req)?;
+        Ok(Response::new(resp))
     }
 
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
         let req = request.into_inner();
 
-        let (key, val) = match read_key_val(req.key, req.value) {
-            Err(e) => {
-                log::error!("error reading key-value: {}", e);
-                return Err(Status::unknown(e.to_string()));
-            }
-            Ok((k, v)) => (k, v),
-        };
-
-        log::info!("PUT: key '{}', value '{}'", key, val);
-
-        let mut tree = self.tree.lock().await;
-
-        if req.lease != 0 {
-            let mut leases = self.leases.lock().await;
-            match leases.get_mut(&req.lease) {
-                Some(info) => {
-                    info.keys.insert(key.clone());
-                }
-                None => {
-                    return Err(Status::failed_precondition(format!(
-                        "lease {} not found",
-                        req.lease
-                    )));
-                }
-            }
-        }
-
-        let old_val = tree.put(&key, val.as_str());
-        self.persist(&tree);
-        let prev_kv = match (old_val, req.prev_kv) {
-            (Some(v), true) => Some(create_kv(&v.0, &v.1)),
-            (_, _) => None,
-        };
-
-        self.send_put(
-            Some(create_kv(key.as_str(), val.as_str())),
-            prev_kv.clone(),
+        log::info!(
+            "PUT: key '{}', value '{}'",
+            String::from_utf8_lossy(&req.key),
+            String::from_utf8_lossy(&req.value)
         );
 
-        Ok(Response::new(PutResponse {
-            prev_kv: if req.prev_kv { prev_kv } else { None },
-        }))
+        let mut tree = self.tree.lock().await;
+        let mut leases = self.leases.lock().await;
+
+        let mut log = txn::CommitLog::default();
+        let resp = txn::put_core(&mut tree, &leases, &req, &mut log)?;
+        self.apply_commit_log(&mut tree, &mut leases, log);
+        drop(tree);
+        drop(leases);
+
+        Ok(Response::new(resp))
     }
 
     async fn delete_range(
@@ -292,67 +229,52 @@ impl Kv for Stash {
     ) -> Result<Response<DeleteRangeResponse>, Status> {
         let req = request.into_inner();
 
-        let (key, range_end) = match read_key_val(req.key, req.range_end) {
-            Err(e) => {
-                log::error!("error reading key-range_end: {}", e);
-                return Err(Status::invalid_argument(e.to_string()));
-            }
-            Ok((k, v)) => (k, v),
-        };
-
         log::info!(
             "DELETE: key '{}' range_end '{}' prev_kv '{}'",
-            key,
-            range_end,
+            String::from_utf8_lossy(&req.key),
+            String::from_utf8_lossy(&req.range_end),
             req.prev_kv
         );
 
         let mut tree = self.tree.lock().await;
+        let mut log = txn::CommitLog::default();
+        let resp = txn::delete_core(&mut tree, &req, &mut log)?;
+        let mut leases = self.leases.lock().await;
+        self.apply_commit_log(&mut tree, &mut leases, log);
+        drop(leases);
+        drop(tree);
 
-        let mut prev_kvs = vec![];
-
-        // same range semantics as range(): empty range_end deletes the single
-        // key, "\0" deletes all keys >= key, otherwise [key, range_end)
-        let matches: Vec<_> = if range_end.is_empty() {
-            tree.get(key.as_str()).into_iter().collect()
-        } else if range_end == "\0" {
-            tree.scan(&key, None)
-        } else {
-            tree.scan(&key, Some(&range_end))
-        };
-
-        let count = matches.len() as i64;
-        let deleted_keys: Vec<String> = matches.iter().map(|kv| kv.0.clone()).collect();
-        for item in matches {
-            tree.delete(item.0.as_str());
-            prev_kvs.push(create_kv(item.0.as_str(), item.1.as_str()));
-        }
-        self.persist(&tree);
-
-        // detach deleted keys from any lease that still references them
-        if !deleted_keys.is_empty() {
-            let mut leases = self.leases.lock().await;
-            for info in leases.values_mut() {
-                for key in &deleted_keys {
-                    info.keys.remove(key);
-                }
-            }
-        }
-
-        for kv in &prev_kvs {
-            // a delete event carries the deleted key itself (etcd semantics)
-            let key = String::from_utf8_lossy(&kv.key);
-            self.send_delete(Some(create_kv(&key, "")), Some(kv.clone()));
-        }
-
-        Ok(Response::new(DeleteRangeResponse {
-            deleted: count,
-            prev_kvs: if req.prev_kv { prev_kvs } else { vec![] },
-        }))
+        Ok(Response::new(resp))
     }
 
-    async fn txn(&self, _request: Request<TxnRequest>) -> Result<Response<TxnResponse>, Status> {
-        Err(Status::unimplemented("transactions are not implemented"))
+    async fn txn(&self, request: Request<TxnRequest>) -> Result<Response<TxnResponse>, Status> {
+        let req = request.into_inner();
+
+        // lock order tree -> leases everywhere; held for the whole txn so it
+        // is atomic with respect to lease expiry and other writers.
+        let mut tree = self.tree.lock().await;
+        let mut leases = self.leases.lock().await;
+
+        // run the transaction on a shadow clone and swap it in only on
+        // success: no partial states, no undo journal.
+        let mut shadow = tree.clone();
+        let mut ctx = txn::TxnCtx {
+            tree: &mut shadow,
+            leases: &leases,
+            log: txn::CommitLog::default(),
+            depth: 0,
+            ops_budget: txn::MAX_TXN_TOTAL_OPS,
+        };
+        let resp = txn::apply_txn(&mut ctx, &req)?;
+        let txn_log = ctx.log;
+
+        // commit: swap the shadow tree in, then apply deferred effects
+        *tree = shadow;
+        self.apply_commit_log(&mut tree, &mut leases, txn_log);
+        drop(tree);
+        drop(leases);
+
+        Ok(Response::new(resp))
     }
 }
 
@@ -639,7 +561,8 @@ mod tests {
     use tonic::Request;
 
     use crate::proto::galadh::kv_server::Kv;
-    use crate::proto::galadh::{DeleteRangeRequest, PutRequest, RangeRequest};
+    use crate::proto::galadh::{DeleteRangeRequest, PutRequest, RangeRequest, TxnRequest};
+    use crate::proto::galadh::{compare, request_op, response_op, Compare, RequestOp};
 
     use super::Stash;
     use super::utils::{load_snapshot, prefix_end};
@@ -1025,12 +948,552 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_txn_is_still_unimplemented() {
-        use crate::proto::galadh::TxnRequest;
+    async fn test_txn_empty_request_succeeds() {
+        let stash = Stash::new();
+        let resp = stash
+            .txn(Request::new(TxnRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.succeeded);
+        assert!(resp.responses.is_empty());
+    }
+
+    /// create-if-absent: `version EQUAL 0` is true only while the key does
+    /// not exist, so the first txn puts and the second takes the failure
+    /// branch — the etcd lock idiom.
+    #[tokio::test]
+    async fn test_txn_create_if_absent() {
+        let make = |value: &'static str| TxnRequest {
+            compare: vec![Compare {
+                result: compare::CompareResult::Equal as i32,
+                target: compare::CompareTarget::Version as i32,
+                key: b"lock".to_vec(),
+                target_union: Some(compare::TargetUnion::Version(0)),
+                ..Default::default()
+            }],
+            success: vec![RequestOp {
+                request: Some(request_op::Request::RequestPut(PutRequest {
+                    key: b"lock".to_vec(),
+                    value: value.as_bytes().to_vec(),
+                    ..Default::default()
+                })),
+            }],
+            failure: vec![RequestOp {
+                request: Some(request_op::Request::RequestPut(PutRequest {
+                    key: b"failed".to_vec(),
+                    value: b"1".to_vec(),
+                    ..Default::default()
+                })),
+            }],
+        };
 
         let stash = Stash::new();
-        let resp = stash.txn(Request::new(TxnRequest::default())).await;
-        assert_eq!(resp.unwrap_err().code(), tonic::Code::Unimplemented);
+        let first = stash.txn(Request::new(make("holder1"))).await.unwrap().into_inner();
+        assert!(first.succeeded);
+
+        let second = stash.txn(Request::new(make("holder2"))).await.unwrap().into_inner();
+        assert!(!second.succeeded);
+
+        // the success branch of the first txn and the failure branch of the
+        // second are both visible
+        let tree = stash.tree.lock().await;
+        assert_eq!(tree.get("lock").unwrap().1, "holder1");
+        assert_eq!(tree.get("failed").unwrap().1, "1");
+    }
+
+    #[tokio::test]
+    async fn test_txn_cas() {
+        let cas = |expected: &'static str, new: &'static str| TxnRequest {
+            compare: vec![Compare {
+                result: compare::CompareResult::Equal as i32,
+                target: compare::CompareTarget::Value as i32,
+                key: b"cas".to_vec(),
+                target_union: Some(compare::TargetUnion::Value(expected.as_bytes().to_vec())),
+                ..Default::default()
+            }],
+            success: vec![RequestOp {
+                request: Some(request_op::Request::RequestPut(PutRequest {
+                    key: b"cas".to_vec(),
+                    value: new.as_bytes().to_vec(),
+                    ..Default::default()
+                })),
+            }],
+            failure: vec![],
+        };
+
+        let stash = Stash::new();
+        stash
+            .put(Request::new(PutRequest {
+                key: b"cas".to_vec(),
+                value: b"v1".to_vec(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+
+        let resp = stash.txn(Request::new(cas("v1", "v2"))).await.unwrap().into_inner();
+        assert!(resp.succeeded);
+
+        // old value no longer matches -> guard false, value stays "v2"
+        let resp = stash.txn(Request::new(cas("v1", "v3"))).await.unwrap().into_inner();
+        assert!(!resp.succeeded);
+        let tree = stash.tree.lock().await;
+        assert_eq!(tree.get("cas").unwrap().1, "v2");
+    }
+
+    /// VALUE on a missing key is always false, even NOT_EQUAL — etcd
+    /// semantics: absence is not "some other value".
+    #[tokio::test]
+    async fn test_txn_value_compare_on_missing_key_is_false() {
+        let stash = Stash::new();
+        let resp = stash
+            .txn(Request::new(TxnRequest {
+                compare: vec![Compare {
+                    result: compare::CompareResult::NotEqual as i32,
+                    target: compare::CompareTarget::Value as i32,
+                    key: b"missing".to_vec(),
+                    target_union: Some(compare::TargetUnion::Value(b"x".to_vec())),
+                    ..Default::default()
+                }],
+                success: vec![RequestOp {
+                    request: Some(request_op::Request::RequestPut(PutRequest {
+                        key: b"should-not-exist".to_vec(),
+                        value: b"1".to_vec(),
+                        ..Default::default()
+                    })),
+                }],
+                failure: vec![],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.succeeded);
+        let tree = stash.tree.lock().await;
+        assert!(tree.get("should-not-exist").is_none());
+    }
+
+    /// Operations in the chosen branch see the writes of earlier operations
+    /// of the same txn (read-your-writes), including a nested txn's guard.
+    #[tokio::test]
+    async fn test_txn_read_your_writes() {
+        let stash = Stash::new();
+        let req = TxnRequest {
+            compare: vec![],
+            success: vec![
+                RequestOp {
+                    request: Some(request_op::Request::RequestPut(PutRequest {
+                        key: b"k".to_vec(),
+                        value: b"v".to_vec(),
+                        ..Default::default()
+                    })),
+                },
+                RequestOp {
+                    request: Some(request_op::Request::RequestRange(RangeRequest {
+                        key: b"k".to_vec(),
+                        ..Default::default()
+                    })),
+                },
+                RequestOp {
+                    request: Some(request_op::Request::RequestTxn(TxnRequest {
+                        compare: vec![Compare {
+                            result: compare::CompareResult::Equal as i32,
+                            target: compare::CompareTarget::Value as i32,
+                            key: b"k".to_vec(),
+                            target_union: Some(compare::TargetUnion::Value(b"v".to_vec())),
+                            ..Default::default()
+                        }],
+                        success: vec![RequestOp {
+                            request: Some(request_op::Request::RequestPut(PutRequest {
+                                key: b"seen".to_vec(),
+                                value: b"1".to_vec(),
+                                ..Default::default()
+                            })),
+                        }],
+                        failure: vec![],
+                    })),
+                },
+            ],
+            failure: vec![],
+        };
+
+        let resp = stash.txn(Request::new(req)).await.unwrap().into_inner();
+        assert!(resp.succeeded);
+        assert_eq!(resp.responses.len(), 3);
+
+        // the range inside the txn already saw the new value
+        let range = match resp.responses[1].response.as_ref().unwrap() {
+            response_op::Response::ResponseRange(r) => r,
+            other => panic!("expected range response, got {:?}", other),
+        };
+        assert_eq!(range.count, 1);
+        assert_eq!(range.kvs[0].value, b"v".to_vec());
+
+        // the nested txn's guard saw it too
+        let tree = stash.tree.lock().await;
+        assert!(tree.get("seen").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_txn_rejects_conflicting_writes() {
+        let put = |key: &'static str| RequestOp {
+            request: Some(request_op::Request::RequestPut(PutRequest {
+                key: key.as_bytes().to_vec(),
+                value: b"v".to_vec(),
+                ..Default::default()
+            })),
+        };
+        let del = |key: &'static str| RequestOp {
+            request: Some(request_op::Request::RequestDeleteRange(DeleteRangeRequest {
+                key: key.as_bytes().to_vec(),
+                ..Default::default()
+            })),
+        };
+
+        let stash = Stash::new();
+
+        // duplicate put of one key
+        let dup = TxnRequest {
+            compare: vec![],
+            success: vec![put("k"), put("k")],
+            failure: vec![],
+        };
+        let err = stash.txn(Request::new(dup)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        // put inside the deleted range of the same txn ([a, b) covers "ab")
+        let conflict = TxnRequest {
+            compare: vec![],
+            success: vec![
+                RequestOp {
+                    request: Some(request_op::Request::RequestDeleteRange(DeleteRangeRequest {
+                        key: b"a".to_vec(),
+                        range_end: b"b".to_vec(),
+                        ..Default::default()
+                    })),
+                },
+                put("ab"),
+            ],
+            failure: vec![],
+        };
+        let err = stash.txn(Request::new(conflict)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        // overlapping delete ranges are fine (both apply)
+        let overlap = TxnRequest {
+            compare: vec![],
+            success: vec![del("a"), del("abc")], // [a,b) and [abc,abd) overlap on "abc"
+            failure: vec![],
+        };
+        stash
+            .put(Request::new(PutRequest {
+                key: b"abc".to_vec(),
+                value: b"v".to_vec(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let resp = stash.txn(Request::new(overlap)).await.unwrap().into_inner();
+        assert!(resp.succeeded);
+        let tree = stash.tree.lock().await;
+        assert!(tree.get("abc").is_none());
+    }
+
+    /// An error in the middle of the chosen branch aborts the whole txn:
+    /// nothing is written, no events are emitted.
+    #[tokio::test]
+    async fn test_txn_error_midway_applies_nothing() {
+        let stash = Stash::new();
+        let mut rx = stash.tx.subscribe();
+
+        let req = TxnRequest {
+            compare: vec![],
+            success: vec![
+                RequestOp {
+                    request: Some(request_op::Request::RequestPut(PutRequest {
+                        key: b"first".to_vec(),
+                        value: b"1".to_vec(),
+                        ..Default::default()
+                    })),
+                },
+                // unknown lease -> failed_precondition
+                RequestOp {
+                    request: Some(request_op::Request::RequestPut(PutRequest {
+                        key: b"second".to_vec(),
+                        value: b"2".to_vec(),
+                        lease: 424242,
+                        ..Default::default()
+                    })),
+                },
+            ],
+            failure: vec![],
+        };
+
+        let err = stash.txn(Request::new(req)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+        let tree = stash.tree.lock().await;
+        assert!(tree.get("first").is_none());
+        drop(tree);
+
+        // no events leaked from the aborted txn
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A txn with mutations emits events in operation order after commit;
+    /// a failed txn emits none.
+    #[tokio::test]
+    async fn test_txn_event_order() {
+        let stash = Stash::new();
+        let mut rx = stash.tx.subscribe();
+
+        stash
+            .put(Request::new(PutRequest {
+                key: b"gone".to_vec(),
+                value: b"v".to_vec(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        // drain the put event from setup
+        rx.try_recv().unwrap();
+
+        let req = TxnRequest {
+            compare: vec![],
+            success: vec![
+                RequestOp {
+                    request: Some(request_op::Request::RequestPut(PutRequest {
+                        key: b"a".to_vec(),
+                        value: b"1".to_vec(),
+                        ..Default::default()
+                    })),
+                },
+                RequestOp {
+                    request: Some(request_op::Request::RequestDeleteRange(DeleteRangeRequest {
+                        key: b"gone".to_vec(),
+                        ..Default::default()
+                    })),
+                },
+                RequestOp {
+                    request: Some(request_op::Request::RequestPut(PutRequest {
+                        key: b"c".to_vec(),
+                        value: b"3".to_vec(),
+                        ..Default::default()
+                    })),
+                },
+            ],
+            failure: vec![],
+        };
+        let resp = stash.txn(Request::new(req)).await.unwrap().into_inner();
+        assert!(resp.succeeded);
+
+        let ev1 = rx.try_recv().unwrap();
+        assert_eq!(ev1.r#type, 0); // PUT a
+        assert_eq!(ev1.kv.as_ref().unwrap().key, b"a".to_vec());
+
+        let ev2 = rx.try_recv().unwrap();
+        assert_eq!(ev2.r#type, 1); // DELETE gone
+        assert_eq!(ev2.kv.as_ref().unwrap().key, b"gone".to_vec());
+        assert_eq!(ev2.prev_kv.as_ref().unwrap().value, b"v".to_vec());
+
+        let ev3 = rx.try_recv().unwrap();
+        assert_eq!(ev3.r#type, 0); // PUT c
+        assert!(rx.try_recv().is_err());
+
+        // a failed txn emits no events
+        let failing = TxnRequest {
+            compare: vec![Compare {
+                result: compare::CompareResult::Equal as i32,
+                target: compare::CompareTarget::Version as i32,
+                key: b"nonexistent".to_vec(),
+                target_union: Some(compare::TargetUnion::Version(1)),
+                ..Default::default()
+            }],
+            success: vec![RequestOp {
+                request: Some(request_op::Request::RequestPut(PutRequest {
+                    key: b"never".to_vec(),
+                    value: b"1".to_vec(),
+                    ..Default::default()
+                })),
+            }],
+            failure: vec![],
+        };
+        let resp = stash.txn(Request::new(failing)).await.unwrap().into_inner();
+        assert!(!resp.succeeded);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_txn_persists_snapshot_once() {
+        let dir = std::env::temp_dir().join(format!("galadh-txn-{}", std::process::id()));
+        let path = dir.join("galadh.snapshot");
+
+        let persisted = Stash::with_snapshot(path.clone()).unwrap();
+
+        let req = TxnRequest {
+            compare: vec![],
+            success: vec![
+                RequestOp {
+                    request: Some(request_op::Request::RequestPut(PutRequest {
+                        key: b"t1".to_vec(),
+                        value: b"1".to_vec(),
+                        ..Default::default()
+                    })),
+                },
+                RequestOp {
+                    request: Some(request_op::Request::RequestPut(PutRequest {
+                        key: b"t2".to_vec(),
+                        value: b"2".to_vec(),
+                        ..Default::default()
+                    })),
+                },
+            ],
+            failure: vec![],
+        };
+        persisted.txn(Request::new(req)).await.unwrap();
+
+        let kvs = load_snapshot(&path).unwrap();
+        let keys: Vec<_> = kvs.iter().map(|kv| kv.0.as_str()).collect();
+        assert_eq!(keys, vec!["t1", "t2"]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_txn_nesting_depth_limit() {
+        let stash = Stash::new();
+
+        // 5 levels of nesting work
+        let mut inner = TxnRequest::default();
+        for _ in 0..5 {
+            inner = TxnRequest {
+                compare: vec![],
+                success: vec![RequestOp {
+                    request: Some(request_op::Request::RequestTxn(inner)),
+                }],
+                failure: vec![],
+            };
+        }
+        let resp = stash.txn(Request::new(inner)).await.unwrap().into_inner();
+        assert!(resp.succeeded);
+
+        // 33 levels are rejected instead of overflowing the stack
+        let mut inner = TxnRequest::default();
+        for _ in 0..33 {
+            inner = TxnRequest {
+                compare: vec![],
+                success: vec![RequestOp {
+                    request: Some(request_op::Request::RequestTxn(inner)),
+                }],
+                failure: vec![],
+            };
+        }
+        let err = stash.txn(Request::new(inner)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("nesting too deep"));
+    }
+
+    #[tokio::test]
+    async fn test_txn_too_many_ops_rejected() {
+        let stash = Stash::new();
+        let req = TxnRequest {
+            compare: vec![],
+            success: (0..129)
+                .map(|i| RequestOp {
+                    request: Some(request_op::Request::RequestPut(PutRequest {
+                        key: format!("key-{i}").into_bytes(),
+                        value: b"v".to_vec(),
+                        ..Default::default()
+                    })),
+                })
+                .collect(),
+            failure: vec![],
+        };
+        let err = stash.txn(Request::new(req)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("too many operations"));
+    }
+
+    /// Txn through the real gRPC stack: create-if-absent over the wire.
+    #[tokio::test]
+    async fn test_txn_over_grpc() {
+        use crate::proto::galadh::kv_client::KvClient;
+        use crate::proto::galadh::kv_server::KvServer;
+        use crate::proto::galadh::{Compare, TxnRequest};
+
+        let stash = Stash::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(KvServer::new(stash))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        let mut kv = KvClient::connect(format!("http://{addr}")).await.unwrap();
+        let txn_req = TxnRequest {
+            compare: vec![Compare {
+                result: compare::CompareResult::Equal as i32,
+                target: compare::CompareTarget::Version as i32,
+                key: b"wire".to_vec(),
+                target_union: Some(compare::TargetUnion::Version(0)),
+                ..Default::default()
+            }],
+            success: vec![RequestOp {
+                request: Some(request_op::Request::RequestPut(PutRequest {
+                    key: b"wire".to_vec(),
+                    value: b"first".to_vec(),
+                    ..Default::default()
+                })),
+            }],
+            failure: vec![RequestOp {
+                request: Some(request_op::Request::RequestPut(PutRequest {
+                    key: b"wire-failed".to_vec(),
+                    value: b"lost".to_vec(),
+                    ..Default::default()
+                })),
+            }],
+        };
+
+        let resp = kv.txn(Request::new(txn_req.clone())).await.unwrap().into_inner();
+        assert!(resp.succeeded);
+        let resp = kv.txn(Request::new(txn_req)).await.unwrap().into_inner();
+        assert!(!resp.succeeded);
+
+        let got = kv
+            .range(Request::new(RangeRequest {
+                key: b"wire".to_vec(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(got.kvs[0].value, b"first".to_vec());
+        // the failure branch of the second txn ran
+        let got = kv
+            .range(Request::new(RangeRequest {
+                key: b"wire-failed".to_vec(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(got.count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_put_rejects_empty_key() {
+        let stash = Stash::new();
+        let resp = stash
+            .put(Request::new(PutRequest {
+                key: vec![],
+                value: b"v".to_vec(),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(resp.unwrap_err().code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]
