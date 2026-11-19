@@ -1,32 +1,57 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::Stream;
-use tokio::sync::Mutex;
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex, broadcast, mpsc};
 use tonic::{Request, Response, Status, Streaming};
+use tokio_stream::wrappers::ReceiverStream;
 
 use utils::{create_kv, read_key_val};
 
 use crate::proto::galadh::{
     DeleteRangeRequest, DeleteRangeResponse, KeyValue, LeaseGrantRequest, LeaseGrantResponse,
     LeaseKeepAliveRequest, LeaseKeepAliveResponse, LeaseLeasesRequest, LeaseLeasesResponse,
-    LeaseRevokeRequest, LeaseRevokeResponse, LeaseTimeToLiveRequest, LeaseTimeToLiveResponse,
-    PutRequest, PutResponse, RangeRequest, RangeResponse, TxnRequest, TxnResponse, WatchRequest,
-    WatchResponse,
+    LeaseRevokeRequest, LeaseRevokeResponse, LeaseStatus, LeaseTimeToLiveRequest,
+    LeaseTimeToLiveResponse, PutRequest, PutResponse, RangeRequest, RangeResponse, TxnRequest,
+    TxnResponse, WatchCreateRequest, WatchRequest, WatchResponse,
 };
 use crate::proto::galadh::Event;
 use crate::proto::galadh::kv_server::Kv;
 use crate::proto::galadh::lease_server::Lease;
+use crate::proto::galadh::watch_request;
 use crate::proto::galadh::watch_server::Watch;
 use crate::trie::TrieMap;
 
 mod utils;
 
+/// A registered lease: TTL in seconds, the moment it lapses and the keys
+/// attached to it. Key -> lease association lives only here (the trie value
+/// does not carry the lease id), so KeyValue.lease in responses is always 0.
+#[derive(Debug)]
+struct LeaseInfo {
+    ttl: i64,
+    expires_at: Instant,
+    keys: HashSet<String>,
+}
+
+static LEASE_SEQ: AtomicI64 = AtomicI64::new(1);
+
+fn next_lease_id() -> i64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    millis * 1000 + LEASE_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 #[derive(Clone)]
 pub struct Stash {
     tree: Arc<Mutex<TrieMap>>,
+    leases: Arc<Mutex<HashMap<i64, LeaseInfo>>>,
     tx: broadcast::Sender<Event>,
     snapshot: Option<PathBuf>,
 }
@@ -34,12 +59,7 @@ pub struct Stash {
 impl Stash {
     #[allow(dead_code)]
     pub fn new() -> Self {
-        let (tx, _rx) = broadcast::channel::<Event>(100);
-        Self {
-            tree: Arc::new(Mutex::new(TrieMap::new())),
-            tx,
-            snapshot: None,
-        }
+        Self::build(TrieMap::new(), None)
     }
 
     /// Create a Stash persisted to `path`: the snapshot is loaded on start
@@ -56,12 +76,69 @@ impl Stash {
         } else if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let (tx, _rx) = broadcast::channel::<Event>(100);
-        Ok(Self {
+        Ok(Self::build(tree, Some(path)))
+    }
+
+    fn build(tree: TrieMap, snapshot: Option<PathBuf>) -> Self {
+        let stash = Self {
             tree: Arc::new(Mutex::new(tree)),
-            tx,
-            snapshot: Some(path),
-        })
+            leases: Arc::new(Mutex::new(HashMap::new())),
+            tx: broadcast::channel::<Event>(256).0,
+            snapshot,
+        };
+        stash.spawn_expiry_task();
+        stash
+    }
+
+    /// Periodically revoke expired leases (deleting their keys). Must be
+    /// called from within a tokio runtime.
+    fn spawn_expiry_task(&self) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let now = Instant::now();
+                let expired: Vec<i64> = {
+                    let leases = state.leases.lock().await;
+                    leases
+                        .iter()
+                        .filter(|(_, info)| info.expires_at <= now)
+                        .map(|(id, _)| *id)
+                        .collect()
+                };
+                for id in expired {
+                    let deleted = state.revoke_lease(id).await;
+                    if deleted > 0 {
+                        log::info!("expired lease {}: {} keys deleted", id, deleted);
+                    }
+                }
+            }
+        });
+    }
+
+    /// Remove the lease and delete all keys attached to it, emitting a
+    /// delete event per key. Returns the number of keys deleted.
+    async fn revoke_lease(&self, id: i64) -> usize {
+        let keys: Vec<String> = {
+            let mut leases = self.leases.lock().await;
+            match leases.remove(&id) {
+                Some(info) => info.keys.into_iter().collect(),
+                None => return 0,
+            }
+        };
+        let mut tree = self.tree.lock().await;
+        let mut deleted = 0;
+        for key in keys {
+            if tree.get(&key).is_some() {
+                tree.delete(&key);
+                deleted += 1;
+                self.send_delete(Some(create_kv(&key, "")), None);
+            }
+        }
+        self.persist(&tree);
+        log::info!("lease {} revoked, {} keys deleted", id, deleted);
+        deleted
     }
 
     fn persist(&self, tree: &TrieMap) {
@@ -177,6 +254,21 @@ impl Kv for Stash {
 
         let mut tree = self.tree.lock().await;
 
+        if req.lease != 0 {
+            let mut leases = self.leases.lock().await;
+            match leases.get_mut(&req.lease) {
+                Some(info) => {
+                    info.keys.insert(key.clone());
+                }
+                None => {
+                    return Err(Status::failed_precondition(format!(
+                        "lease {} not found",
+                        req.lease
+                    )));
+                }
+            }
+        }
+
         let old_val = tree.put(&key, val.as_str());
         self.persist(&tree);
         let prev_kv = match (old_val, req.prev_kv) {
@@ -230,14 +322,27 @@ impl Kv for Stash {
         };
 
         let count = matches.len() as i64;
+        let deleted_keys: Vec<String> = matches.iter().map(|kv| kv.0.clone()).collect();
         for item in matches {
             tree.delete(item.0.as_str());
             prev_kvs.push(create_kv(item.0.as_str(), item.1.as_str()));
         }
         self.persist(&tree);
 
+        // detach deleted keys from any lease that still references them
+        if !deleted_keys.is_empty() {
+            let mut leases = self.leases.lock().await;
+            for info in leases.values_mut() {
+                for key in &deleted_keys {
+                    info.keys.remove(key);
+                }
+            }
+        }
+
         for kv in &prev_kvs {
-            self.send_delete(None, Some(kv.clone()))
+            // a delete event carries the deleted key itself (etcd semantics)
+            let key = String::from_utf8_lossy(&kv.key);
+            self.send_delete(Some(create_kv(&key, "")), Some(kv.clone()));
         }
 
         Ok(Response::new(DeleteRangeResponse {
@@ -255,16 +360,49 @@ impl Kv for Stash {
 impl Lease for Stash {
     async fn lease_grant(
         &self,
-        _request: Request<LeaseGrantRequest>,
+        request: Request<LeaseGrantRequest>,
     ) -> Result<Response<LeaseGrantResponse>, Status> {
-        Err(Status::unimplemented("leases are not implemented"))
+        let req = request.into_inner();
+        if req.ttl <= 0 {
+            return Err(Status::invalid_argument("TTL must be positive"));
+        }
+        let id = if req.id != 0 { req.id } else { next_lease_id() };
+
+        let mut leases = self.leases.lock().await;
+        if leases.contains_key(&id) {
+            return Err(Status::failed_precondition(format!(
+                "lease {} already exists",
+                id
+            )));
+        }
+        leases.insert(
+            id,
+            LeaseInfo {
+                ttl: req.ttl,
+                expires_at: Instant::now() + Duration::from_secs(req.ttl as u64),
+                keys: HashSet::new(),
+            },
+        );
+        drop(leases);
+
+        log::info!("lease {} granted, ttl {}s", id, req.ttl);
+        Ok(Response::new(LeaseGrantResponse {
+            id,
+            ttl: req.ttl,
+            error: String::new(),
+        }))
     }
 
     async fn lease_revoke(
         &self,
-        _request: Request<LeaseRevokeRequest>,
+        request: Request<LeaseRevokeRequest>,
     ) -> Result<Response<LeaseRevokeResponse>, Status> {
-        Err(Status::unimplemented("leases are not implemented"))
+        let req = request.into_inner();
+        let deleted = self.revoke_lease(req.id).await;
+        if deleted == 0 {
+            log::info!("lease {} revoke: lease not found", req.id);
+        }
+        Ok(Response::new(LeaseRevokeResponse {}))
     }
 
     type LeaseKeepAliveStream =
@@ -272,23 +410,106 @@ impl Lease for Stash {
 
     async fn lease_keep_alive(
         &self,
-        _request: Request<Streaming<LeaseKeepAliveRequest>>,
+        request: Request<Streaming<LeaseKeepAliveRequest>>,
     ) -> Result<Response<Self::LeaseKeepAliveStream>, Status> {
-        Err(Status::unimplemented("leases are not implemented"))
+        let mut inbound = request.into_inner();
+        let (out_tx, out_rx) = mpsc::channel::<Result<LeaseKeepAliveResponse, Status>>(16);
+        let state = self.clone();
+
+        tokio::spawn(async move {
+            while let Ok(Some(req)) = inbound.message().await {
+                let ttl = {
+                    let mut leases = state.leases.lock().await;
+                    match leases.get_mut(&req.id) {
+                        Some(info) => {
+                            info.expires_at = Instant::now() + Duration::from_secs(info.ttl as u64);
+                            info.ttl
+                        }
+                        None => -1, // unknown or expired lease
+                    }
+                };
+                let resp = LeaseKeepAliveResponse { id: req.id, ttl };
+                if out_tx.send(Ok(resp)).await.is_err() {
+                    break; // client went away
+                }
+            }
+        });
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(out_rx))))
     }
 
     async fn lease_time_to_live(
         &self,
-        _request: Request<LeaseTimeToLiveRequest>,
+        request: Request<LeaseTimeToLiveRequest>,
     ) -> Result<Response<LeaseTimeToLiveResponse>, Status> {
-        Err(Status::unimplemented("leases are not implemented"))
+        let req = request.into_inner();
+        let leases = self.leases.lock().await;
+        let resp = match leases.get(&req.id) {
+            Some(info) => {
+                let ttl = info
+                    .expires_at
+                    .saturating_duration_since(Instant::now())
+                    .as_secs() as i64;
+                let keys = if req.keys {
+                    info.keys.iter().map(|k| k.as_bytes().to_vec()).collect()
+                } else {
+                    vec![]
+                };
+                LeaseTimeToLiveResponse {
+                    id: req.id,
+                    ttl,
+                    granted_ttl: info.ttl,
+                    keys,
+                }
+            }
+            None => LeaseTimeToLiveResponse {
+                id: req.id,
+                ttl: -1,
+                granted_ttl: 0,
+                keys: vec![],
+            },
+        };
+        Ok(Response::new(resp))
     }
 
     async fn lease_leases(
         &self,
         _request: Request<LeaseLeasesRequest>,
     ) -> Result<Response<LeaseLeasesResponse>, Status> {
-        Err(Status::unimplemented("leases are not implemented"))
+        let leases = self.leases.lock().await;
+        let list = leases
+            .keys()
+            .map(|id| LeaseStatus { id: *id })
+            .collect();
+        Ok(Response::new(LeaseLeasesResponse { leases: list }))
+    }
+}
+
+/// Per-stream watcher registration.
+struct WatcherSpec {
+    key: Vec<u8>,
+    range_end: Vec<u8>,
+    filters: Vec<i32>,
+    prev_kv: bool,
+}
+
+impl WatcherSpec {
+    /// etcd range semantics: empty range_end watches a single key,
+    /// "\0" everything >= key, otherwise [key, range_end).
+    fn matches(&self, key: &[u8]) -> bool {
+        if self.range_end.is_empty() {
+            return key == &self.key[..];
+        }
+        if self.range_end == b"\0" {
+            return key >= &self.key[..];
+        }
+        key >= &self.key[..] && key < &self.range_end[..]
+    }
+
+    fn filter_allows(&self, event_type: i32) -> bool {
+        // FilterType: 0 = NOPUT, 1 = NODELETE
+        !(self.filters.contains(&0) && event_type == 0)
+            && !(self.filters.contains(&1) && event_type == 1)
     }
 }
 
@@ -298,9 +519,118 @@ impl Watch for Stash {
 
     async fn watch(
         &self,
-        _request: Request<Streaming<WatchRequest>>,
+        request: Request<Streaming<WatchRequest>>,
     ) -> Result<Response<Self::WatchStream>, Status> {
-        Err(Status::unimplemented("watch is not implemented"))
+        let mut inbound = request.into_inner();
+        let (out_tx, out_rx) = mpsc::channel::<Result<WatchResponse, Status>>(64);
+        let mut events = self.tx.subscribe();
+
+        tokio::spawn(async move {
+            // watch_id -> spec, local to this stream
+            let mut watchers: HashMap<i64, WatcherSpec> = HashMap::new();
+            let mut next_id: i64 = 1;
+
+            loop {
+                tokio::select! {
+                    req = inbound.message() => {
+                        match req {
+                            Ok(Some(wr)) => match wr.request_union {
+                                Some(watch_request::RequestUnion::CreateRequest(create)) => {
+                                    let id = if create.watch_id != 0 {
+                                        create.watch_id
+                                    } else {
+                                        next_id
+                                    };
+                                    next_id = next_id.max(id) + 1;
+                                    log::info!(
+                                        "WATCH create id {} key '{}' range_end '{}'",
+                                        id,
+                                        String::from_utf8_lossy(&create.key),
+                                        String::from_utf8_lossy(&create.range_end)
+                                    );
+                                    let WatchCreateRequest {
+                                        key,
+                                        range_end,
+                                        filters,
+                                        prev_kv,
+                                        ..
+                                    } = create;
+                                    watchers.insert(
+                                        id,
+                                        WatcherSpec { key, range_end, filters, prev_kv },
+                                    );
+                                    let resp = WatchResponse {
+                                        watch_id: id,
+                                        created: true,
+                                        ..Default::default()
+                                    };
+                                    if out_tx.send(Ok(resp)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                Some(watch_request::RequestUnion::CancelRequest(cancel)) => {
+                                    log::info!("WATCH cancel id {}", cancel.watch_id);
+                                    watchers.remove(&cancel.watch_id);
+                                    let resp = WatchResponse {
+                                        watch_id: cancel.watch_id,
+                                        canceled: true,
+                                        ..Default::default()
+                                    };
+                                    if out_tx.send(Ok(resp)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                _ => {} // progress request: no-op
+                            },
+                            Ok(None) => break, // client closed the stream
+                            Err(e) => {
+                                log::warn!("watch inbound stream error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                    ev = events.recv() => {
+                        match ev {
+                            Ok(event) => {
+                                let key: Vec<u8> = event
+                                    .kv
+                                    .as_ref()
+                                    .map(|kv| kv.key.clone())
+                                    .unwrap_or_default();
+                                for (id, spec) in &watchers {
+                                    if !spec.matches(&key) || !spec.filter_allows(event.r#type) {
+                                        continue;
+                                    }
+                                    let event = if spec.prev_kv {
+                                        event.clone()
+                                    } else {
+                                        Event {
+                                            prev_kv: None,
+                                            ..event.clone()
+                                        }
+                                    };
+                                    let resp = WatchResponse {
+                                        watch_id: *id,
+                                        events: vec![event],
+                                        ..Default::default()
+                                    };
+                                    if out_tx.send(Ok(resp)).await.is_err() {
+                                        return; // client went away
+                                    }
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                log::warn!("watch stream lagged, {} events dropped", n);
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
+            }
+            log::info!("watch stream closed");
+        });
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(out_rx))))
     }
 }
 
@@ -695,55 +1025,209 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unimplemented_rpcs_return_status() {
-        use crate::proto::galadh::lease_server::Lease;
-        use crate::proto::galadh::{
-            LeaseGrantRequest, LeaseRevokeRequest, LeaseTimeToLiveRequest, LeaseLeasesRequest,
-            TxnRequest,
-        };
+    async fn test_txn_is_still_unimplemented() {
+        use crate::proto::galadh::TxnRequest;
 
         let stash = Stash::new();
-
         let resp = stash.txn(Request::new(TxnRequest::default())).await;
-        assert_eq!(resp.unwrap_err().code(), tonic::Code::Unimplemented);
-
-        let resp = stash
-            .lease_grant(Request::new(LeaseGrantRequest::default()))
-            .await;
-        assert_eq!(resp.unwrap_err().code(), tonic::Code::Unimplemented);
-
-        let resp = stash
-            .lease_revoke(Request::new(LeaseRevokeRequest::default()))
-            .await;
-        assert_eq!(resp.unwrap_err().code(), tonic::Code::Unimplemented);
-
-        let resp = stash
-            .lease_time_to_live(Request::new(LeaseTimeToLiveRequest::default()))
-            .await;
-        assert_eq!(resp.unwrap_err().code(), tonic::Code::Unimplemented);
-
-        let resp = stash
-            .lease_leases(Request::new(LeaseLeasesRequest::default()))
-            .await;
         assert_eq!(resp.unwrap_err().code(), tonic::Code::Unimplemented);
     }
 
-    /// Streaming rpcs cannot be called directly (tonic's `Streaming` type is
-    /// not constructible outside the transport), so run a real in-process
-    /// server and hit watch/lease_keep_alive over the wire.
     #[tokio::test]
-    async fn test_streaming_rpcs_unimplemented_over_grpc() {
-        use crate::proto::galadh::lease_server::LeaseServer;
+    async fn test_lease_grant_revoke_deletes_attached_keys() {
+        use crate::proto::galadh::lease_server::Lease;
+        use crate::proto::galadh::{LeaseGrantRequest, LeaseRevokeRequest};
+
+        let stash = Stash::new();
+        let lease = stash
+            .lease_grant(Request::new(LeaseGrantRequest {
+                ttl: 60,
+                id: 777,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(lease.id, 777);
+
+        // attach a key to the lease
+        stash
+            .put(Request::new(PutRequest {
+                key: b"leased".to_vec(),
+                value: b"v".to_vec(),
+                lease: 777,
+                prev_kv: false,
+                ignore_value: false,
+                ignore_lease: false,
+            }))
+            .await
+            .unwrap();
+
+        // revoke: the attached key must disappear
+        stash
+            .lease_revoke(Request::new(LeaseRevokeRequest { id: 777 }))
+            .await
+            .unwrap();
+
+        let resp = stash
+            .range(Request::new(RangeRequest {
+                key: b"leased".to_vec(),
+                range_end: vec![],
+                limit: 0,
+                sort_order: 0,
+                sort_target: 0,
+                keys_only: false,
+                count_only: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_put_with_unknown_lease_fails() {
+        let stash = Stash::new();
+        let resp = stash
+            .put(Request::new(PutRequest {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                lease: 42,
+                prev_kv: false,
+                ignore_value: false,
+                ignore_lease: false,
+            }))
+            .await;
+        assert_eq!(resp.unwrap_err().code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn test_lease_time_to_live_lists_attached_keys() {
+        use crate::proto::galadh::lease_server::Lease;
+        use crate::proto::galadh::{LeaseGrantRequest, LeaseTimeToLiveRequest};
+
+        let stash = Stash::new();
+        let lease = stash
+            .lease_grant(Request::new(LeaseGrantRequest {
+                ttl: 60,
+                id: 0, // server-assigned id
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_ne!(lease.id, 0);
+
+        stash
+            .put(Request::new(PutRequest {
+                key: b"attached".to_vec(),
+                value: b"v".to_vec(),
+                lease: lease.id,
+                prev_kv: false,
+                ignore_value: false,
+                ignore_lease: false,
+            }))
+            .await
+            .unwrap();
+
+        let ttl = stash
+            .lease_time_to_live(Request::new(LeaseTimeToLiveRequest {
+                id: lease.id,
+                keys: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(ttl.ttl > 0 && ttl.ttl <= 60);
+        assert_eq!(ttl.keys, vec![b"attached".to_vec()]);
+
+        // unknown lease reports ttl == -1
+        let ttl = stash
+            .lease_time_to_live(Request::new(LeaseTimeToLiveRequest {
+                id: 12345,
+                keys: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(ttl.ttl, -1);
+    }
+
+    /// A lease with ttl = 1s must expire and delete its keys within a few
+    /// seconds via the background expiry task.
+    #[tokio::test]
+    async fn test_lease_expiry_deletes_keys() {
+        use crate::proto::galadh::lease_server::Lease;
+        use crate::proto::galadh::LeaseGrantRequest;
+
+        let stash = Stash::new();
+        let lease = stash
+            .lease_grant(Request::new(LeaseGrantRequest {
+                ttl: 1,
+                id: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        stash
+            .put(Request::new(PutRequest {
+                key: b"ephemeral".to_vec(),
+                value: b"v".to_vec(),
+                lease: lease.id,
+                prev_kv: false,
+                ignore_value: false,
+                ignore_lease: false,
+            }))
+            .await
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let count = stash
+                .range(Request::new(RangeRequest {
+                    key: b"ephemeral".to_vec(),
+                    range_end: vec![],
+                    limit: 0,
+                    sort_order: 0,
+                    sort_target: 0,
+                    keys_only: false,
+                    count_only: false,
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .count;
+            if count == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "lease key was not expired within 5s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Watch/keepalive are streaming rpcs — test them over a real in-process
+    /// gRPC server.
+    #[tokio::test]
+    async fn test_watch_and_lease_keepalive_over_grpc() {
+        use crate::proto::galadh::kv_client::KvClient;
+        use crate::proto::galadh::kv_server::KvServer;
         use crate::proto::galadh::lease_client::LeaseClient;
-        use crate::proto::galadh::watch_server::WatchServer;
+        use crate::proto::galadh::lease_server::LeaseServer;
         use crate::proto::galadh::watch_client::WatchClient;
-        use crate::proto::galadh::{LeaseKeepAliveRequest, WatchRequest};
+        use crate::proto::galadh::watch_server::WatchServer;
+        use crate::proto::galadh::watch_request::RequestUnion;
+        use crate::proto::galadh::{
+            LeaseGrantRequest, LeaseKeepAliveRequest, PutRequest, WatchCreateRequest, WatchRequest,
+        };
 
         let stash = Stash::new();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             tonic::transport::Server::builder()
+                .add_service(KvServer::new(stash.clone()))
                 .add_service(LeaseServer::new(stash.clone()))
                 .add_service(WatchServer::new(stash))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
@@ -751,24 +1235,113 @@ mod tests {
                 .unwrap();
         });
 
-        let mut lease = LeaseClient::connect(format!("http://{addr}")).await.unwrap();
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        tokio::spawn(async move {
-            tx.send(LeaseKeepAliveRequest::default()).await.unwrap();
-        });
-        let resp = lease
-            .lease_keep_alive(tokio_stream::wrappers::ReceiverStream::new(rx))
-            .await;
-        assert_eq!(resp.unwrap_err().code(), tonic::Code::Unimplemented);
-
+        // --- watch: prefix "foo", then put/delete two keys via Kv service
         let mut watch = WatchClient::connect(format!("http://{addr}")).await.unwrap();
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        tokio::spawn(async move {
-            tx.send(WatchRequest::default()).await.unwrap();
-        });
-        let resp = watch
-            .watch(tokio_stream::wrappers::ReceiverStream::new(rx))
-            .await;
-        assert_eq!(resp.unwrap_err().code(), tonic::Code::Unimplemented);
+        let (wtx, wrx) = tokio::sync::mpsc::channel::<WatchRequest>(8);
+        let mut stream = watch
+            .watch(tokio_stream::wrappers::ReceiverStream::new(wrx))
+            .await
+            .unwrap()
+            .into_inner();
+
+        wtx.send(WatchRequest {
+            request_union: Some(RequestUnion::CreateRequest(WatchCreateRequest {
+                key: b"foo".to_vec(),
+                range_end: prefix_end(b"foo"),
+                ..Default::default()
+            })),
+        })
+        .await
+        .unwrap();
+
+        let created = tokio::time::timeout(std::time::Duration::from_secs(2), stream.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(created.created);
+        let watch_id = created.watch_id;
+
+        let mut kv = KvClient::connect(format!("http://{addr}")).await.unwrap();
+        kv.put(Request::new(PutRequest {
+            key: b"foo".to_vec(),
+            value: b"bar".to_vec(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+        let put_event = tokio::time::timeout(std::time::Duration::from_secs(2), stream.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(put_event.watch_id, watch_id);
+        assert_eq!(put_event.events.len(), 1);
+        assert_eq!(put_event.events[0].r#type, 0); // PUT
+        assert_eq!(
+            put_event.events[0].kv.as_ref().unwrap().key,
+            b"foo".to_vec()
+        );
+
+        // key outside the watched prefix must NOT produce an event
+        kv.put(Request::new(PutRequest {
+            key: b"other".to_vec(),
+            value: b"x".to_vec(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+        // --- lease keepalive over the wire
+        let mut lease = LeaseClient::connect(format!("http://{addr}")).await.unwrap();
+        let granted = lease
+            .lease_grant(LeaseGrantRequest { ttl: 60, id: 0 })
+            .await
+            .unwrap()
+            .into_inner();
+
+        let (ltx, lrx) = tokio::sync::mpsc::channel::<LeaseKeepAliveRequest>(8);
+        let mut keepalive = lease
+            .lease_keep_alive(tokio_stream::wrappers::ReceiverStream::new(lrx))
+            .await
+            .unwrap()
+            .into_inner();
+        ltx.send(LeaseKeepAliveRequest { id: granted.id })
+            .await
+            .unwrap();
+        let ka = tokio::time::timeout(std::time::Duration::from_secs(2), keepalive.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(ka.id, granted.id);
+        assert_eq!(ka.ttl, 60);
+
+        // unknown lease -> ttl == -1
+        ltx.send(LeaseKeepAliveRequest { id: 999999 })
+            .await
+            .unwrap();
+        let ka = tokio::time::timeout(std::time::Duration::from_secs(2), keepalive.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(ka.ttl, -1);
+
+        // --- cancel the watcher
+        wtx.send(WatchRequest {
+            request_union: Some(RequestUnion::CancelRequest(
+                crate::proto::galadh::WatchCancelRequest { watch_id },
+            )),
+        })
+        .await
+        .unwrap();
+        let canceled = tokio::time::timeout(std::time::Duration::from_secs(2), stream.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(canceled.canceled);
     }
 }
